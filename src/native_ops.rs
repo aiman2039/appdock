@@ -32,10 +32,11 @@ pub fn optional<T>(result: Result<T>) -> Result<Option<T>> {
 #[derive(Debug, PartialEq, Eq)]
 pub enum Membership {
     Present(usize),
-    Closed,
+    Missing,
 }
-/// Only complete, successful enumeration establishes absence. Cached state/title
-/// reads never participate. Ambiguity retains recovery instead of guessing.
+/// Cached state/title reads never participate. Ambiguity retains recovery
+/// instead of guessing. An empty or unmatched list is missing, not closed:
+/// the process may still own the window after an AX handle replacement.
 pub fn membership(
     exact: Option<usize>,
     identifier: Option<&str>,
@@ -45,17 +46,33 @@ pub fn membership(
     if let Some(index) = exact {
         return Ok(Membership::Present(index));
     }
-    let Some(identifier) = identifier else {
-        return Ok(Membership::Closed);
-    };
-    let mut matches = vec![];
+    let mut listed = Vec::new();
     for (index, candidate) in candidates.into_iter().enumerate() {
-        if candidate?.as_deref() == Some(identifier) {
-            matches.push(index);
-        }
+        listed.push((index, candidate?));
     }
+    if let [(index, _)] = listed.as_slice()
+        && owners == 1
+    {
+        return Ok(Membership::Present(*index));
+    }
+    unique_identifier(identifier, owners, &listed)
+}
+
+fn unique_identifier(
+    identifier: Option<&str>,
+    owners: usize,
+    listed: &[(usize, Option<String>)],
+) -> Result<Membership> {
+    let Some(identifier) = identifier else {
+        return Ok(Membership::Missing);
+    };
+    let matches: Vec<usize> = listed
+        .iter()
+        .filter(|(_, candidate)| candidate.as_deref() == Some(identifier))
+        .map(|(index, _)| *index)
+        .collect();
     match matches.as_slice() {
-        [] => Ok(Membership::Closed),
+        [] => Ok(Membership::Missing),
         [index] if owners == 1 => Ok(Membership::Present(*index)),
         _ => Err(BackendError::new(
             ErrorKind::Communication,
@@ -228,10 +245,22 @@ mod tests {
     }
     #[test]
     fn a1_membership_ignores_cached_attributes_and_rebinds_only_unique_identity() {
-        assert_eq!(membership(None, None, 1, []).unwrap(), Membership::Closed);
+        assert_eq!(membership(None, None, 1, []).unwrap(), Membership::Missing);
         assert_eq!(
             membership(None, Some("unique"), 1, [Ok(Some("unique".into()))]).unwrap(),
             Membership::Present(0)
+        );
+        assert_eq!(
+            membership(None, None, 1, [Ok(None)]).unwrap(),
+            Membership::Present(0)
+        );
+        assert_eq!(
+            membership(None, Some("gone"), 1, [Ok(None)]).unwrap(),
+            Membership::Present(0)
+        );
+        assert_eq!(
+            membership(None, None, 1, [Ok(None), Ok(None)]).unwrap(),
+            Membership::Missing
         );
         assert!(membership(None, Some("unique"), 2, [Ok(Some("unique".into()))]).is_err());
         assert!(
@@ -253,8 +282,14 @@ mod tests {
             .is_err()
         );
         assert_eq!(
-            membership(None, Some("gone"), 1, [Ok(None)]).unwrap(),
-            Membership::Closed
+            membership(
+                None,
+                Some("gone"),
+                1,
+                [Ok(Some("other".into())), Ok(Some("else".into()))]
+            )
+            .unwrap(),
+            Membership::Missing
         );
     }
     #[test]

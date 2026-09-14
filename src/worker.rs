@@ -516,6 +516,7 @@ pub fn start(workspace: Workspace) -> Client {
                             windows = w;
                             discovery_complete = true;
                             discovery_failed = false;
+                            dirty |= engine.rebind_disconnected(&windows);
                             if status.starts_with("Grant AppDock Accessibility") {
                                 status = "Add an existing window to begin.".into();
                             }
@@ -734,8 +735,11 @@ pub fn start(workspace: Workspace) -> Client {
                 next_observe = Instant::now() + Duration::from_millis(250);
                 engine.pointer_down = c.pointer_down.load(Ordering::Relaxed);
                 let tabs_before = engine.workspace.tabs.len();
+                let live_before = engine.live.len();
                 engine.observe();
                 dirty |= engine.workspace.tabs.len() != tabs_before;
+                dirty |= engine.live.len() != live_before;
+                dirty |= engine.rebind_disconnected(&windows);
             }
             if let Some(request) = c
                 .mailbox

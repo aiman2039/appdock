@@ -661,6 +661,10 @@ impl WindowBackend for MacBackend {
                 ErrorKind::Closed,
                 "Window closure confirmed",
             )),
+            Refresh::Missing(_) => Err(BackendError::new(
+                ErrorKind::Communication,
+                "Window identity is temporarily unavailable",
+            )),
         }
     }
     fn events(&mut self) -> Vec<BackendEvent> {
@@ -675,6 +679,7 @@ impl WindowBackend for MacBackend {
             .into_iter()
             .map(|id| match self.refresh_window(id, &mut app_windows) {
                 Ok(Refresh::Closed(info)) => BackendEvent::Closed(info),
+                Ok(Refresh::Missing(info)) => BackendEvent::Missing(info),
                 Err(e) if e.kind == ErrorKind::Permission => BackendEvent::PermissionLost,
                 _ => BackendEvent::Changed(id),
             })
@@ -685,6 +690,7 @@ impl WindowBackend for MacBackend {
 enum Refresh {
     Present,
     Closed(ClosedInfo),
+    Missing(ClosedInfo),
 }
 
 fn process_missing(pid: i32) -> bool {
@@ -761,13 +767,15 @@ impl MacBackend {
             (membership, exact, windows.len())
         };
         match membership {
-            crate::native_ops::Membership::Closed => {
-                let reason = if identifier.is_none() {
+            crate::native_ops::Membership::Missing => {
+                let reason = if ax_window_count == 0 {
+                    "empty_window_list"
+                } else if identifier.is_none() {
                     "identifier_absent"
                 } else {
                     "identifier_unmatched"
                 };
-                Ok(self.confirm_closed(ClosedInfo {
+                Ok(Refresh::Missing(ClosedInfo {
                     window: id,
                     pid,
                     bundle,
@@ -780,7 +788,6 @@ impl MacBackend {
                 }))
             }
             crate::native_ops::Membership::Present(index) => {
-                let _ = (bundle, identifier);
                 let replacement = app_windows
                     .get(&pid)
                     .and_then(|result| result.as_ref().ok())
@@ -791,8 +798,17 @@ impl MacBackend {
                 let entry = self.entries.get_mut(&id).ok_or("Window is disconnected")?;
                 if entry.element != replacement {
                     entry.number = None;
+                    crate::event_log::emit(
+                        "rebound",
+                        serde_json::json!({
+                            "window": id,
+                            "pid": pid,
+                            "bundle": bundle,
+                        }),
+                    );
                 }
                 entry.element = replacement;
+                let _ = identifier;
                 Ok(Refresh::Present)
             }
         }

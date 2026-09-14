@@ -1,5 +1,6 @@
-# Plan: attachment lifecycle event log
+# Plan: keep docked-app bond across AX churn
 
-- [x] Task 1: JSONL event log + Closed membership evidence + Open Logs menu
+- [x] Task 1: Missing ≠ Closed; sole-window rebind; 3-poll disconnect keeps tab
+- [x] Task 2: auto-rebind unique disconnected tab by bundle
 
-Stay in current workspace. No docking behavior change.
+Stay here. Rebuild/relaunch to pick this up.

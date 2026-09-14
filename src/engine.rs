@@ -11,6 +11,8 @@ pub struct Attachment {
     pub issue: Option<DockIssue>,
     /// Startup registration has not attempted to control this window yet.
     pub deferred_startup: bool,
+    /// Consecutive Missing polls. Reset when the live handle is present.
+    pub missing_polls: u8,
 }
 pub struct Engine<B: WindowBackend> {
     pub backend: B,
@@ -114,6 +116,7 @@ impl<B: WindowBackend> Engine<B> {
                 docked: false,
                 issue: original.minimized.then_some(DockIssue::Minimized),
                 deferred_startup: false,
+                missing_polls: 0,
             },
         );
         self.backend.watch(window.id, true);
@@ -479,36 +482,10 @@ impl<B: WindowBackend> Engine<B> {
                     crate::event_log::emit("permission_lost", json!({}));
                     self.set_paused(Some("Accessibility permission was revoked".into()));
                 }
-                BackendEvent::Closed(info) => {
-                    let w = info.window;
-                    self.released.retain(|_, a| a.window != w);
-                    self.backend.watch(w, false);
-                    let ids: Vec<_> = self
-                        .live
-                        .iter()
-                        .filter(|(_, a)| a.window == w)
-                        .map(|(id, _)| *id)
-                        .collect();
-                    if ids.is_empty() {
-                        crate::event_log::window_closed(&info, None, None);
-                    }
-                    for id in ids {
-                        let bundle = self
-                            .workspace
-                            .tabs
-                            .iter()
-                            .find(|tab| tab.id == id)
-                            .map(|tab| tab.identity.bundle.clone());
-                        crate::event_log::window_closed(&info, Some(id), bundle.as_deref());
-                        self.live.remove(&id);
-                        self.workspace.tabs.retain(|t| t.id != id);
-                        self.backend.watch(w, false);
-                        if self.selected == Some(id) {
-                            self.selected = None;
-                        }
-                    }
-                }
+                BackendEvent::Closed(info) => self.drop_closed(info),
+                BackendEvent::Missing(info) => self.note_missing(info),
                 BackendEvent::Changed(w) => {
+                    self.reset_missing(w);
                     if let Some((&id, a)) =
                         self.live.iter().find(|(_, a)| a.window == w && a.docked)
                     {
@@ -574,6 +551,139 @@ impl<B: WindowBackend> Engine<B> {
                     }
                 }
             }
+        }
+    }
+    pub fn rebind_disconnected(&mut self, windows: &[WindowInfo]) -> bool {
+        let disconnected: Vec<SavedTab> = self
+            .workspace
+            .tabs
+            .iter()
+            .filter(|tab| !self.live.contains_key(&tab.id))
+            .cloned()
+            .collect();
+        let mut changed = false;
+        for tab in disconnected {
+            if !self.rebind_tab(&tab, windows) {
+                continue;
+            }
+            changed = true;
+        }
+        changed
+    }
+    fn rebind_tab(&mut self, tab: &SavedTab, windows: &[WindowInfo]) -> bool {
+        if tab.identity.bundle.is_empty() {
+            return false;
+        }
+        let matches: Vec<&WindowInfo> = windows
+            .iter()
+            .filter(|window| self.can_rebind(tab, window))
+            .collect();
+        let [window] = matches.as_slice() else {
+            return false;
+        };
+        let selected = self.selected == Some(tab.id);
+        if self.attach(Some(tab.id), window).is_err() {
+            return false;
+        }
+        crate::event_log::emit(
+            "rebound",
+            json!({
+                "tab": tab.id,
+                "window": window.id,
+                "bundle": tab.identity.bundle,
+            }),
+        );
+        if selected {
+            let _ = self.switch(tab.id);
+        }
+        true
+    }
+    fn can_rebind(&self, tab: &SavedTab, window: &WindowInfo) -> bool {
+        window.eligible
+            && window.identity.bundle == tab.identity.bundle
+            && !self
+                .live
+                .values()
+                .any(|attachment| self.backend.same_window(attachment.window, window.id))
+    }
+    fn drop_closed(&mut self, info: ClosedInfo) {
+        let w = info.window;
+        self.released.retain(|_, a| a.window != w);
+        self.backend.watch(w, false);
+        let ids: Vec<_> = self
+            .live
+            .iter()
+            .filter(|(_, a)| a.window == w)
+            .map(|(id, _)| *id)
+            .collect();
+        if ids.is_empty() {
+            crate::event_log::window_closed(&info, None, None);
+        }
+        for id in ids {
+            let bundle = self
+                .workspace
+                .tabs
+                .iter()
+                .find(|tab| tab.id == id)
+                .map(|tab| tab.identity.bundle.clone());
+            crate::event_log::window_closed(&info, Some(id), bundle.as_deref());
+            self.live.remove(&id);
+            self.workspace.tabs.retain(|t| t.id != id);
+            self.backend.watch(w, false);
+            if self.selected == Some(id) {
+                self.selected = None;
+            }
+        }
+    }
+    fn reset_missing(&mut self, window: WindowId) {
+        if let Some(attachment) = self
+            .live
+            .values_mut()
+            .find(|attachment| attachment.window == window)
+        {
+            attachment.missing_polls = 0;
+        }
+    }
+    fn note_missing(&mut self, info: ClosedInfo) {
+        let ids: Vec<_> = self
+            .live
+            .iter()
+            .filter(|(_, attachment)| attachment.window == info.window)
+            .map(|(id, _)| *id)
+            .collect();
+        for id in ids {
+            let polls = {
+                let Some(attachment) = self.live.get_mut(&id) else {
+                    continue;
+                };
+                attachment.missing_polls = attachment.missing_polls.saturating_add(1);
+                attachment.missing_polls
+            };
+            if polls >= 3 {
+                self.disconnect_missing(id, &info);
+            }
+        }
+    }
+    fn disconnect_missing(&mut self, id: TabId, info: &ClosedInfo) {
+        let bundle = self
+            .workspace
+            .tabs
+            .iter()
+            .find(|tab| tab.id == id)
+            .map(|tab| tab.identity.bundle.clone());
+        crate::event_log::emit(
+            "window_disconnected",
+            json!({
+                "tab": id,
+                "bundle": bundle,
+                "window": info.window,
+                "pid": info.pid,
+                "reason": info.reason,
+                "ax_window_count": info.ax_window_count,
+            }),
+        );
+        if let Some(attachment) = self.live.remove(&id) {
+            self.backend.watch(attachment.window, false);
         }
     }
     pub fn resume(&mut self) -> Result<()> {
@@ -954,6 +1064,88 @@ pub(crate) mod tests {
             vec![2]
         );
         assert_eq!(e.selected, None);
+    }
+    fn missing_event(window: WindowId) -> BackendEvent {
+        BackendEvent::Missing(ClosedInfo {
+            window,
+            reason: "empty_window_list".into(),
+            ..ClosedInfo::default()
+        })
+    }
+    #[test]
+    fn missing_handle_does_not_pause_or_drop_before_threshold() {
+        let mut e = fixture();
+        e.switch(1).unwrap();
+        e.backend.events.push(missing_event(1));
+        e.observe();
+        assert!(e.paused.is_none());
+        assert!(e.live.contains_key(&1));
+        assert_eq!(e.workspace.tabs.len(), 2);
+        e.backend.events.push(missing_event(1));
+        e.observe();
+        assert!(e.live.contains_key(&1));
+        assert_eq!(e.live[&1].missing_polls, 2);
+    }
+    #[test]
+    fn missing_handle_disconnects_tab_after_threshold_without_deleting_it() {
+        let mut e = fixture();
+        e.switch(1).unwrap();
+        for _ in 0..3 {
+            e.backend.events.push(missing_event(1));
+            e.observe();
+        }
+        assert!(e.paused.is_none());
+        assert!(!e.live.contains_key(&1));
+        assert!(e.workspace.tabs.iter().any(|tab| tab.id == 1));
+        assert_eq!(e.selected, Some(1));
+    }
+    #[test]
+    fn present_handle_resets_missing_polls() {
+        let mut e = fixture();
+        e.switch(1).unwrap();
+        e.backend.events.push(missing_event(1));
+        e.backend.events.push(missing_event(1));
+        e.observe();
+        assert_eq!(e.live[&1].missing_polls, 2);
+        e.backend.events.push(BackendEvent::Changed(1));
+        e.observe();
+        assert_eq!(e.live[&1].missing_polls, 0);
+        e.backend.events.push(missing_event(1));
+        e.observe();
+        assert!(e.live.contains_key(&1));
+        assert_eq!(e.live[&1].missing_polls, 1);
+    }
+    fn sample_window(id: WindowId, bundle: &str) -> WindowInfo {
+        WindowInfo {
+            id,
+            pid: 10,
+            app: bundle.into(),
+            title: "duplicate".into(),
+            identity: Identity {
+                bundle: bundle.into(),
+                identifier: None,
+            },
+            eligible: true,
+            minimized: false,
+        }
+    }
+    #[test]
+    fn unique_window_rebinds_disconnected_tab() {
+        let mut e = fixture();
+        e.live.remove(&1);
+        e.backend.states.insert(1, e.backend.states[&2]);
+        assert!(e.rebind_disconnected(&[sample_window(1, "same")]));
+        assert!(e.live.contains_key(&1));
+        assert_eq!(e.live[&1].window, 1);
+    }
+    #[test]
+    fn ambiguous_windows_do_not_rebind_disconnected_tab() {
+        let mut e = fixture();
+        e.live.remove(&1);
+        e.backend.states.insert(3, e.backend.states[&2]);
+        assert!(!e.rebind_disconnected(&[sample_window(1, "same"), sample_window(3, "same")]));
+        assert!(!e.live.contains_key(&1));
+        assert!(e.workspace.tabs.iter().any(|tab| tab.id == 1));
     }
     #[test]
     fn moved_window_returns_after_mouse_release_and_keeps_ownership() {

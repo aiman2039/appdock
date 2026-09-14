@@ -170,6 +170,7 @@ pub struct ClosedInfo {
 #[derive(Clone, Debug)]
 pub enum BackendEvent {
     Closed(ClosedInfo),
+    Missing(ClosedInfo),
     Changed(WindowId),
     PermissionLost,
 }
