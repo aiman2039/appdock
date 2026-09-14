@@ -167,7 +167,7 @@ jobs:
           EXPECTED_ARCH: ${{ matrix.arch }}
           RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
         run: |
-          lipo -verify_arch "$EXPECTED_ARCH" dist/AppDock.app/Contents/MacOS/AppDock
+          lipo dist/AppDock.app/Contents/MacOS/AppDock -verify_arch "$EXPECTED_ARCH"
           mkdir -p release-assets
           archive="AppDock-${RELEASE_TAG}-macos-${EXPECTED_ARCH}.zip"
           ditto -c -k --sequesterRsrc --keepParent dist/AppDock.app "release-assets/$archive"
