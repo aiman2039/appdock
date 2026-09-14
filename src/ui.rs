@@ -220,7 +220,7 @@ struct Ivars {
     ui: RefCell<Option<Ui>>,
     ticks: Cell<u64>,
     // Window activation can synchronously reenter from an AppKit call.
-    raise_requested: Cell<bool>,
+    order_requested: Cell<bool>,
     dragging: Cell<bool>,
     tracking_samples: Cell<u64>,
     drag_timer: OnceCell<Retained<NSTimer>>,
@@ -280,7 +280,7 @@ struct Ui {
     last_area: Option<Rect>,
     editing_focus_pending: Option<u64>,
     pending_rename: Option<TabId>,
-    raise_after: Option<std::time::Instant>,
+    order_after: Option<std::time::Instant>,
     last_direct_window: Option<u32>,
 }
 fn sync_selection(u: &mut Ui, s: &worker::Snapshot) {
@@ -330,7 +330,7 @@ define_class!(
         #[unsafe(method(windowWillMove:))] fn will_move(&self,_:&NSNotification){self.start_tracking();}
         #[unsafe(method(windowDidMove:))] fn moved(&self,_:&NSNotification){self.geometry();}
         #[unsafe(method(windowDidResize:))] fn resized(&self,_:&NSNotification){self.geometry();}
-        #[unsafe(method(windowDidBecomeKey:))] fn key(&self,_:&NSNotification){self.ivars().raise_requested.set(true);if let Some(backdrop)=self.ivars().backdrop.get(){backdrop.keep_below_selected();}}
+        #[unsafe(method(windowDidBecomeKey:))] fn key(&self,_:&NSNotification){self.ivars().order_requested.set(true);if let Some(backdrop)=self.ivars().backdrop.get(){backdrop.keep_below_selected();}}
         #[unsafe(method(windowDidResignKey:))] fn resigned_key(&self,_:&NSNotification){self.ivars().rename_blur_requested.set(true);}
     }
     unsafe impl NSTextFieldDelegate for Delegate {}
@@ -802,7 +802,7 @@ impl Delegate {
             last_area: None,
             editing_focus_pending: None,
             pending_rename: None,
-            raise_after: None,
+            order_after: None,
             fixture: fixtures::FixtureState {
                 fixture_child,
                 polish_minimize: None,
@@ -1197,7 +1197,7 @@ impl Delegate {
                     .map(|s| s.frame().size.height)
                     .unwrap_or(900.);
                 u.backdrop.follow(area, primary);
-                u.raise_after = Some(std::time::Instant::now());
+                u.order_after = Some(std::time::Instant::now());
                 u.client.send(Command::Resize(area, frame));
             }
         }
@@ -1257,7 +1257,7 @@ impl Delegate {
             u.last_frame = Some(geometry);
             u.last_area = Some(area);
             u.backdrop.follow(area, primary);
-            u.raise_after = Some(std::time::Instant::now());
+            u.order_after = Some(std::time::Instant::now());
             u.client.send(Command::Resize(area, geometry));
         }
     }
@@ -1602,15 +1602,15 @@ impl Delegate {
         u.surface
             .set_attached(attached && !u.picker_open && !setup_visible && selected_issue.is_none());
         u.hint.setHidden(attached || u.picker_open || setup_visible);
-        if self.ivars().raise_requested.replace(false) {
-            u.raise_after = Some(std::time::Instant::now() - std::time::Duration::from_millis(251));
+        if self.ivars().order_requested.replace(false) {
+            u.order_after = Some(std::time::Instant::now() - std::time::Duration::from_millis(251));
         }
         sync_selection(u, &s);
         let Some(mut b) = self.fixture_simple_step(count, b, &s) else {
             return;
         };
         let u = b.as_mut().unwrap();
-        if u.raise_after.is_some_and(|t| t.elapsed().as_millis() > 250)
+        if u.order_after.is_some_and(|t| t.elapsed().as_millis() > 250)
             && !u.window.inLiveResize()
             && !u.picker_open
             && !u.pending_picker
@@ -1619,8 +1619,27 @@ impl Delegate {
             && u.rename_editor.is_none()
             && u.pending_rename.is_none()
         {
-            u.raise_after = None;
-            u.client.send(Command::Raise);
+            u.order_after = None;
+            // Clicking the title bar or moving the workspace must leave AppDock
+            // active so its menu remains usable. Put only our controls behind the
+            // selected app to preserve click routing; AX focus belongs to explicit
+            // tab selection and other intentional returns to the docked app.
+            if !s.paused
+                && !s.quitting
+                && !s.stopped
+                && selected_issue.is_none()
+                && u.window.isVisible()
+                && !u.window.isMiniaturized()
+                && let Some((number, _)) = &s.backdrop
+                && crate::window_tracking::stack()
+                    .is_some_and(|stack| stack.iter().any(|w| w.number == *number))
+            {
+                let window = u.window.clone();
+                let number = *number;
+                drop(b);
+                window.orderWindow_relativeTo(NSWindowOrderingMode::Below, number as isize);
+                return;
+            }
         }
         let Some(mut b) = self.fixture_docking_step(count, b, &s) else {
             return;

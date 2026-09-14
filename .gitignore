@@ -1,3 +1,4 @@
 /target/
 /dist/
 /scripts/__pycache__/
+.playwright-mcp/

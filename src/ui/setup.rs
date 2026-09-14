@@ -206,7 +206,7 @@ impl Delegate {
             u.setup_auto_shown = true;
             u.pending_settings = false;
             u.client.set_text_editing(true);
-            u.raise_after = None;
+            u.order_after = None;
             if u.setup_wizard.is_none() {
                 let setup = SetupUi::new(self);
                 open_installer = setup.step == Step::Install;

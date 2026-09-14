@@ -20,6 +20,8 @@ pub(super) struct FixtureState {
     pub(super) fixture_keyboard_ready: bool,
     pub(super) startup_menu_stage: u8,
     pub(super) settings_popup_stage: u8,
+    pub(super) title_focus_tick: Option<u64>,
+    pub(super) title_focus_tested: bool,
     pub(super) polish_stage: u8,
     pub(super) polish_selected: Option<TabId>,
     pub(super) polish_minimize: Option<std::thread::JoinHandle<Result<()>>>,
@@ -687,6 +689,65 @@ impl Delegate {
                             !u.window.hasShadow(),
                             "Docked workspace retained an extra shadow around its transparent cutout"
                         );
+                        if !u.fixture.title_focus_tested {
+                            if let Some(started) = u.fixture.title_focus_tick {
+                                // Let activation and the delayed geometry/order work
+                                // settle through several real UI/worker timer turns.
+                                if count < started + 6 {
+                                    return None;
+                                }
+                                let app = NSApplication::sharedApplication(self.mtm());
+                                assert!(
+                                    app.isActive(),
+                                    "Title-bar activation returned focus to the docked app"
+                                );
+                                assert!(
+                                    u.window.isKeyWindow(),
+                                    "AppDock lost its key window after title-bar activation"
+                                );
+                                self.verify_app_pointer_routes(
+                                    &u.window,
+                                    s.backdrop.as_ref().unwrap().0,
+                                    s.selected_frame.unwrap(),
+                                );
+                                let menu = app
+                                    .mainMenu()
+                                    .unwrap()
+                                    .itemAtIndex(0)
+                                    .unwrap()
+                                    .submenu()
+                                    .unwrap();
+                                menu.update();
+                                for title in ["Check for Updates…", "Settings…"] {
+                                    let item = menu
+                                        .itemWithTitle(&NSString::from_str(title))
+                                        .expect("AppDock menu action missing");
+                                    assert!(
+                                        item.isEnabled(),
+                                        "AppDock menu action is unavailable: {title}"
+                                    );
+                                }
+                                u.fixture.title_focus_tested = true;
+                                println!(
+                                    "Title-bar activation retained AppDock keyboard focus and menu actions while the docked app remained clickable"
+                                );
+                            } else {
+                                u.fixture.title_focus_tick = Some(count);
+                                let window = u.window.clone();
+                                drop(b);
+                                // Exercise the same AppKit activation/key-window
+                                // callbacks as clicking the native title bar. Also
+                                // leave a geometry update pending, as after a drag.
+                                #[allow(deprecated)]
+                                NSApplication::sharedApplication(self.mtm())
+                                    .activateIgnoringOtherApps(true);
+                                window.makeKeyAndOrderFront(None);
+                                let mut frame = window.frame();
+                                frame.origin.x += 4.;
+                                window.setFrame_display(frame, true);
+                                return None;
+                            }
+                        }
                         if u.fixture.settings_popup_stage == 0 {
                             assert!(!u.settings_button.isHidden());
                             assert!(u.settings_button.isEnabled());
