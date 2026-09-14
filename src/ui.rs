@@ -372,6 +372,8 @@ define_class!(
         #[unsafe(method(setupNext:))] fn next_setup_action(&self,_:&AnyObject){self.setup_next();}
         #[unsafe(method(setupBack:))] fn back_setup_action(&self,_:&AnyObject){self.setup_back();}
         #[unsafe(method(setupAction:))] fn setup_secondary_action(&self,_:&AnyObject){self.setup_action();}
+        #[unsafe(method(showRunningApp:))] fn show_running_app_action(&self,_:&AnyObject){self.show_running_app();}
+        #[unsafe(method(copyDiagnostics:))] fn copy_diagnostics_action(&self,_:&AnyObject){self.copy_diagnostics();}
         #[unsafe(method(setupLater:))] fn later_setup_action(&self,_:&AnyObject){self.hide_setup();}
         #[unsafe(method(addWindow:))] fn add(&self,_:&AnyObject){self.show_picker(false);}
         #[unsafe(method(replaceWindow:))] fn replace(&self,_:&AnyObject){self.show_picker(true);}
@@ -1793,7 +1795,14 @@ impl Delegate {
             })
             .collect();
         windows.sort_by_key(|w| (w.app.to_lowercase(), w.title.to_lowercase(), w.pid, w.id));
-        u.picker.render(self.mtm(), self, windows);
+        let message = crate::onboarding::picker_message(
+            s.trusted,
+            s.discovery_complete,
+            s.discovery_failed,
+            s.windows.iter().filter(|w| w.eligible).count(),
+            !query.is_empty(),
+        );
+        u.picker.render(self.mtm(), self, windows, message);
     }
     fn show_picker(&self, replace: bool) {
         if self

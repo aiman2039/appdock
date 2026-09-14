@@ -14,6 +14,7 @@ pub(super) struct SetupUi {
     primary: Retained<NSButton>,
     secondary: Retained<NSButton>,
     back: Retained<NSButton>,
+    copy: Retained<NSButton>,
     step: Step,
     generation: u64,
     waiting: bool,
@@ -31,7 +32,7 @@ impl SetupUi {
         view.setBackgroundColor(&theme::color(theme::SURFACE));
         view.setHidden(true);
         let document = NSView::initWithFrame(NSView::alloc(m), rect(0., 0., 700., 560.));
-        let content = NSView::initWithFrame(NSView::alloc(m), rect(30., 20., 640., 520.));
+        let content = NSView::initWithFrame(NSView::alloc(m), rect(30., 20., 640., 620.));
         document.addSubview(&content);
         view.setDocumentView(Some(&document));
         let label = |text: &str, frame, size, color| {
@@ -42,19 +43,29 @@ impl SetupUi {
             content.addSubview(&field);
             field
         };
-        let progress = label("", rect(32., 477., 576., 22.), 12., theme::SECONDARY);
-        let title = label("", rect(32., 426., 576., 38.), 24., theme::TEXT);
-        let detail = label("", rect(32., 286., 576., 132.), 14., theme::SECONDARY);
+        let progress = label("", rect(32., 577., 576., 22.), 12., theme::SECONDARY);
+        let title = label("", rect(32., 526., 576., 38.), 24., theme::TEXT);
+        let detail = label("", rect(32., 310., 576., 198.), 14., theme::SECONDARY);
         let result = label("", rect(32., 90., 576., 118.), 13., theme::TEXT);
         let primary = delegate.button("Continue", sel!(setupNext:), rect(422., 28., 186., 32.));
         primary.setBordered(true);
         let secondary = delegate.button("", sel!(setupAction:), rect(158., 28., 254., 32.));
+        let reveal = delegate.button(
+            "Show This App in Finder",
+            sel!(showRunningApp:),
+            rect(22., 74., 254., 30.),
+        );
+        let copy = delegate.button(
+            "Copy Diagnostics",
+            sel!(copyDiagnostics:),
+            rect(400., 74., 208., 30.),
+        );
         let back = delegate.button("Back", sel!(setupBack:), rect(84., 28., 66., 32.));
         let later = delegate.button("Later", sel!(setupLater:), rect(22., 28., 60., 32.));
-        for button in [&primary, &secondary, &back, &later] {
+        for button in [&primary, &secondary, &back, &later, &reveal, &copy] {
             content.addSubview(button);
         }
-        let install_graphic = NSView::initWithFrame(NSView::alloc(m), rect(120., 180., 400., 112.));
+        let install_graphic = NSView::initWithFrame(NSView::alloc(m), rect(120., 206., 400., 112.));
         let app_icon = NSImage::initWithData(
             NSImage::alloc(),
             &NSData::with_bytes(include_bytes!("../../assets/branding/appdock.png")),
@@ -94,6 +105,7 @@ impl SetupUi {
             primary,
             secondary,
             back,
+            copy,
             step: Step::Install,
             generation: 0,
             waiting: false,
@@ -108,10 +120,10 @@ impl SetupUi {
             visible.origin.y + visible.size.height >= self.document.frame().size.height - 1.;
         self.view.setFrame(bounds);
         let width = bounds.size.width.max(640.);
-        let height = bounds.size.height.max(520.);
+        let height = bounds.size.height.max(620.);
         self.document.setFrameSize(NSSize::new(width, height));
         self.card
-            .setFrameOrigin(NSPoint::new((width - 640.) / 2., (height - 520.) / 2.));
+            .setFrameOrigin(NSPoint::new((width - 640.) / 2., (height - 620.) / 2.));
         if at_top {
             self.scroll_to_top();
         }
@@ -130,6 +142,56 @@ impl SetupUi {
 }
 
 impl Delegate {
+    pub(super) fn show_running_app(&self) {
+        if let Ok(path) = std::env::current_exe() {
+            let app = crate::onboarding::running_app(&path);
+            let url = objc2_foundation::NSURL::fileURLWithPath(&NSString::from_str(
+                &app.display().to_string(),
+            ));
+            NSWorkspace::sharedWorkspace()
+                .activateFileViewerSelectingURLs(&objc2_foundation::NSArray::from_slice(&[&*url]));
+        }
+    }
+    pub(super) fn copy_diagnostics(&self) {
+        let report = {
+            let borrow = self.ivars().ui.borrow();
+            let Some(u) = borrow.as_ref() else { return };
+            let s = u.client.snapshot.lock().unwrap();
+            format!(
+                "AppDock {}\nRunning executable: {}\nSigning metadata from executable on disk:\n{}\nAccessibility granted: {}\nDiscovery completed: {}\nDiscovery failed: {}\nCompatible windows: {}\nDesktop geometry verified: {}\nLast error category/code (may precede recovery): {}\nWindow titles and message contents are excluded.",
+                env!("CARGO_PKG_VERSION"),
+                std::env::current_exe()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|_| "Unavailable".into()),
+                s.signing_identity,
+                s.trusted,
+                s.discovery_complete,
+                s.discovery_failed,
+                if s.discovery_complete {
+                    s.windows.iter().filter(|w| w.eligible).count().to_string()
+                } else {
+                    "Not verified".into()
+                },
+                s.readiness.desktop_available,
+                s.diagnostic_error.as_deref().unwrap_or("None recorded")
+            )
+        };
+        let pasteboard = NSPasteboard::generalPasteboard();
+        pasteboard.clearContents();
+        let copied = pasteboard.setString_forType(&NSString::from_str(&report), unsafe {
+            NSPasteboardTypeString
+        });
+        if let Some(u) = self.ivars().ui.borrow().as_ref()
+            && let Some(setup) = &u.setup_wizard
+        {
+            setup.copy.setTitle(&NSString::from_str(if copied {
+                "Diagnostics copied"
+            } else {
+                "Copy failed — retry"
+            }));
+        }
+    }
+
     pub(super) fn show_setup(&self) {
         self.dismiss_picker(false);
         self.finish_rename(true);
@@ -343,6 +405,9 @@ impl Delegate {
             let installed = path.starts_with("/Applications/")
                 || std::env::var("HOME")
                     .is_ok_and(|home| path.starts_with(&format!("{home}/Applications/")));
+            let app_path = crate::onboarding::running_app(std::path::Path::new(&path))
+                .display()
+                .to_string();
             let (title, detail, result, primary, secondary, enabled) = match setup.step {
                 Step::Install => (
                     "Install AppDock",
@@ -367,12 +432,16 @@ impl Delegate {
                     true,
                 ),
                 Step::Permission => (
-                    "Allow window control",
-                    "Open Accessibility settings and enable AppDock.\nThis lets it move, resize and focus the windows you choose.\nIf AppDock is already enabled but this check fails: remove its old entry, add this running copy with +, then quit and reopen AppDock.\nScreen Recording and Input Monitoring are not required.",
                     if s.trusted {
-                        "Verified: macOS grants this running copy Accessibility access.".into()
+                        "Window access granted"
                     } else {
-                        "Not verified: macOS has not granted this process access.\nThis check updates automatically when you return.".into()
+                        "AppDock doesn’t have window access"
+                    },
+                    "Open Accessibility Settings and enable AppDock.\nAlready enabled? macOS may remember a different copy.\n1. Remove AppDock using −.\n2. Click + and select the app shown below.\n3. Enable it, then quit and reopen AppDock.",
+                    if s.trusted {
+                        "Window access granted.\nContinue to check for compatible windows.".into()
+                    } else {
+                        format!("Select this app:\n{app_path}\nAccess is checked automatically.")
                     },
                     "Continue",
                     "Open Accessibility Settings",
@@ -388,7 +457,7 @@ impl Delegate {
                     } else if !s.readiness.desktop_available {
                         "Cannot read desktop window geometry.\nReopen AppDock in your logged-in desktop session and retry.".into()
                     } else if s.readiness.eligible_windows == 0 {
-                        "No controllable windows found.\nOpen a normal Finder or TextEdit window on this desktop, leave fullscreen, close dialogs, then retry.".into()
+                        "Window access granted, but no compatible windows were found.\nOpen a normal Finder or TextEdit window, then click Check again.".into()
                     } else {
                         format!(
                             "Verified: {} controllable window(s) and desktop geometry access.\n{}",
@@ -443,7 +512,7 @@ impl Delegate {
             };
             setup.install_graphic.setHidden(setup.step != Step::Install);
             setup.result.setFrame(if setup.step == Step::Install {
-                rect(32., 78., 576., 92.)
+                rect(32., 108., 576., 92.)
             } else {
                 rect(32., 130., 576., 130.)
             });

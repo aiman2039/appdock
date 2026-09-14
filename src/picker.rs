@@ -111,6 +111,7 @@ pub struct InlinePicker {
     list: Retained<NSView>,
     refresh: Retained<NSButton>,
     cancel: Retained<NSButton>,
+    diagnostics: Retained<NSButton>,
     attach: Retained<NSButton>,
     rows: Vec<Retained<ChoiceRow>>,
     pub choice_ids: Vec<WindowId>,
@@ -137,6 +138,9 @@ impl InlinePicker {
             13.,
             theme::SECONDARY,
         );
+        if let Some(cell) = empty.cell() {
+            cell.setWraps(true);
+        }
         let search = NSTextField::initWithFrame(NSTextField::alloc(m), rect(0., 0., 100., 30.));
         search.setBezeled(false);
         search.setBordered(false);
@@ -158,6 +162,7 @@ impl InlinePicker {
         let list = NSView::initWithFrame(NSView::alloc(m), rect(0., 0., 100., 100.));
         scroll.setDocumentView(Some(&list));
         let refresh = button(m, target, "Refresh", sel!(refreshWindows:));
+        let diagnostics = button(m, target, "Setup & Diagnostics", sel!(showSetup:));
         let cancel = button(m, target, "Cancel", sel!(cancelPicker:));
         let attach = button(m, target, "Attach window", sel!(attachWindow:));
         attach.setBordered(true);
@@ -172,6 +177,7 @@ impl InlinePicker {
             &*search,
             &*scroll,
             &*refresh,
+            &*diagnostics,
             &*cancel,
             &*attach,
         ] {
@@ -187,6 +193,7 @@ impl InlinePicker {
             scroll,
             list,
             refresh,
+            diagnostics,
             cancel,
             attach,
             rows: vec![],
@@ -207,8 +214,9 @@ impl InlinePicker {
         self.count.setFrame(rect(24., h - 140., w - 48., 18.));
         self.scroll
             .setFrame(rect(24., 68., w - 48., (h - 218.).max(50.)));
-        self.empty.setFrame(rect(24., h - 175., w - 48., 24.));
+        self.empty.setFrame(rect(24., h - 242., w - 48., 90.));
         self.refresh.setFrame(rect(24., 20., 80., 28.));
+        self.diagnostics.setFrame(rect(108., 20., 170., 28.));
         self.cancel.setFrame(rect(w - 238., 20., 80., 28.));
         self.attach.setFrame(rect(w - 150., 20., 126., 28.));
         self.layout_rows();
@@ -276,8 +284,14 @@ impl InlinePicker {
             13.,
         ));
     }
-    pub fn render(&mut self, m: MainThreadMarker, target: &AnyObject, windows: Vec<&WindowInfo>) {
-        let signature = format!("{windows:?}");
+    pub fn render(
+        &mut self,
+        m: MainThreadMarker,
+        target: &AnyObject,
+        windows: Vec<&WindowInfo>,
+        message: &str,
+    ) {
+        let signature = format!("{windows:?}:{message}");
         if signature == self.signature {
             return;
         }
@@ -330,7 +344,9 @@ impl InlinePicker {
             self.list.addSubview(&row);
             self.rows.push(row);
         }
+        self.empty.setStringValue(&NSString::from_str(message));
         self.empty.setHidden(!self.rows.is_empty());
+        self.scroll.setHidden(self.rows.is_empty());
         self.count.setStringValue(&NSString::from_str(&format!(
             "{} available window{}",
             self.rows.len(),

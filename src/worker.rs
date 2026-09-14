@@ -22,6 +22,10 @@ pub struct Snapshot {
     pub occupied: Vec<WindowId>,
     pub status: String,
     pub trusted: bool,
+    pub discovery_complete: bool,
+    pub discovery_failed: bool,
+    pub diagnostic_error: Option<String>,
+    pub signing_identity: String,
     pub readiness: crate::onboarding::Readiness,
     pub setup_docked: bool,
     pub setup_completion: Option<(u64, std::result::Result<(), String>)>,
@@ -256,6 +260,10 @@ fn client(workspace: Workspace) -> Client {
         occupied: vec![],
         status: "Add an existing window to begin.".into(),
         trusted: false,
+        discovery_complete: false,
+        discovery_failed: false,
+        diagnostic_error: None,
+        signing_identity: "Checking signing identity…".into(),
         readiness: Default::default(),
         setup_docked: false,
         setup_completion: None,
@@ -298,6 +306,27 @@ pub fn start(workspace: Workspace) -> Client {
         let mut geometry_revision = 0;
         let mut startup = crate::startup::Startup::new(engine.workspace.startup_apps.clone());
         let mut discovery_complete = false;
+        // Signing inspection must not delay permission checks or window operations.
+        let (signing_tx, signing_rx) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            let identity = std::env::current_exe()
+                .ok()
+                .and_then(|path| {
+                    std::process::Command::new("/usr/bin/codesign")
+                        .args(["-dv", "--verbose=4"])
+                        .arg(path)
+                        .output()
+                        .ok()
+                })
+                .map(|output| {
+                    crate::onboarding::signing_metadata(&String::from_utf8_lossy(&output.stderr))
+                })
+                .unwrap_or_else(|| "Signing identity unavailable".into());
+            let _ = signing_tx.send(identity);
+        });
+        let mut signing_identity = "Checking signing identity…".to_string();
+        let mut discovery_failed = false;
+        let mut diagnostic_error = None;
         let mut readiness = crate::onboarding::Readiness::default();
         let mut setup_window = None;
         let mut setup_completion = None;
@@ -393,8 +422,16 @@ pub fn start(workspace: Workspace) -> Client {
                                 found.iter().filter(|w| w.eligible).count();
                             windows = found;
                             discovery_complete = true;
+                            discovery_failed = false;
                         }
                         Err(e) => {
+                            windows.clear();
+                            discovery_failed = true;
+                            discovery_complete = false;
+                            diagnostic_error = Some(format!(
+                                "Window check: {:?}, AX code: {:?}",
+                                e.kind, e.ax_code
+                            ));
                             readiness.error = Some(if e.kind == ErrorKind::Cancelled {
                                 "Window check was interrupted or timed out. Close unresponsive apps and retry.".into()
                             } else {
@@ -423,9 +460,17 @@ pub fn start(workspace: Workspace) -> Client {
                             epoch == c.mailbox.interruption.load(Ordering::SeqCst)
                                 && !c.mailbox.priority_pending()
                         })
+                        .inspect_err(|e| {
+                            windows.clear();
+                            discovery_failed = true;
+                            discovery_complete = false;
+                            diagnostic_error =
+                                Some(format!("Discovery: {:?}, AX code: {:?}", e.kind, e.ax_code));
+                        })
                         .map(|w| {
                             windows = w;
                             discovery_complete = true;
+                            discovery_failed = false;
                             if status.starts_with("Grant AppDock Accessibility") {
                                 status = "Add an existing window to begin.".into();
                             }
@@ -588,6 +633,8 @@ pub fn start(workspace: Workspace) -> Client {
                 _ => Ok(()),
             };
             if let Err(e) = result {
+                diagnostic_error =
+                    Some(format!("Operation: {:?}, AX code: {:?}", e.kind, e.ax_code));
                 if e.kind != ErrorKind::Cancelled {
                     status = e.to_string();
                 }
@@ -660,6 +707,9 @@ pub fn start(workspace: Workspace) -> Client {
                 discovery_complete = false;
             }
             badges.retain(|id, _| engine.live.contains_key(id));
+            if let Ok(identity) = signing_rx.try_recv() {
+                signing_identity = identity;
+            }
             *c.snapshot.lock().unwrap() = Snapshot {
                 workspace: engine.workspace.clone(),
                 selected: engine.selected,
@@ -691,6 +741,10 @@ pub fn start(workspace: Workspace) -> Client {
                         .unwrap_or_else(|| status.clone())
                 },
                 trusted: engine.backend.trusted(),
+                discovery_complete,
+                discovery_failed,
+                diagnostic_error: diagnostic_error.clone(),
+                signing_identity: signing_identity.clone(),
                 readiness: readiness.clone(),
                 setup_completion: setup_completion.clone(),
                 setup_docked: setup_window.is_some_and(|window| {

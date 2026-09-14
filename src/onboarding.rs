@@ -62,9 +62,94 @@ pub fn from_installer(path: &std::path::Path) -> bool {
             .any(|part| part.as_os_str() == "AppTranslocation")
 }
 
+/// Reveal the enclosing app bundle, or the executable for development launches.
+pub fn running_app(path: &std::path::Path) -> &std::path::Path {
+    path.ancestors()
+        .find(|p| p.extension().is_some_and(|ext| ext == "app"))
+        .unwrap_or(path)
+}
+
+pub fn picker_message(
+    trusted: bool,
+    complete: bool,
+    failed: bool,
+    eligible: usize,
+    searching: bool,
+) -> &'static str {
+    if !trusted {
+        "AppDock doesn’t have window access.\nOpen Setup & Diagnostics below for help enabling it.\nAlready enabled? macOS may remember a different copy."
+    } else if failed {
+        "Window access is granted, but the window check failed.\nOpen Setup & Diagnostics below, or try Refresh."
+    } else if !complete {
+        "Window access granted.\nChecking available windows…"
+    } else if eligible == 0 {
+        "Window access granted, but no compatible windows were found.\nOpen a normal Finder or TextEdit window, then click Refresh."
+    } else if searching {
+        "No matching windows.\nTry another search or clear the search field."
+    } else {
+        "No more windows are available to add.\nCompatible windows may already be in your workspace."
+    }
+}
+
+/// Only allow signing metadata; never copy arbitrary tool output or window data.
+pub fn signing_metadata(output: &str) -> String {
+    let lines: Vec<_> = output
+        .lines()
+        .filter(|line| {
+            [
+                "Identifier=",
+                "TeamIdentifier=",
+                "Authority=",
+                "CDHash=",
+                "Signature=",
+            ]
+            .iter()
+            .any(|prefix| line.starts_with(prefix))
+        })
+        .collect();
+    if lines.is_empty() {
+        "Signing identity unavailable".into()
+    } else {
+        lines.join("\n")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn picker_explains_permission_before_search_or_old_results() {
+        assert!(picker_message(false, true, false, 5, true).contains("doesn’t have window access"));
+        assert!(picker_message(true, false, true, 0, false).contains("check failed"));
+        assert!(picker_message(true, false, false, 0, false).contains("Checking"));
+        assert!(picker_message(true, true, false, 0, false).contains("no compatible windows"));
+        assert!(picker_message(true, true, false, 5, true).contains("No matching"));
+        assert!(picker_message(true, true, false, 5, false).contains("already"));
+    }
+    #[test]
+    fn diagnostics_exclude_unexpected_output_and_reveal_the_exact_bundle() {
+        assert_eq!(
+            signing_metadata(
+                "Executable=/private/example\nIdentifier=dev.appdock.AppDock\nSecret window title\nTeamIdentifier=EXAMPLE"
+            ),
+            "Identifier=dev.appdock.AppDock\nTeamIdentifier=EXAMPLE"
+        );
+        assert_eq!(
+            signing_metadata("tool failed"),
+            "Signing identity unavailable"
+        );
+        use std::path::Path;
+        assert_eq!(
+            running_app(Path::new(
+                "/Applications/AppDock.app/Contents/MacOS/AppDock"
+            )),
+            Path::new("/Applications/AppDock.app")
+        );
+        assert_eq!(
+            running_app(Path::new("/tmp/target/debug/appdock")),
+            Path::new("/tmp/target/debug/appdock")
+        );
+    }
     #[test]
     fn installer_detection_distinguishes_installed_and_development_copies() {
         use std::path::Path;
