@@ -1,2 +1,0 @@
-review case=RestoreReady accessibility=true
-Native readiness delay hook was not exercised

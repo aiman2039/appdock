@@ -2,3 +2,4 @@
 /dist/
 /scripts/__pycache__/
 .playwright-mcp/
+docs/review-evidence/

@@ -1,2 +1,0 @@
-Review fixtures require a fresh isolated directory without workspace.json
-Existing workspace preserved byte-for-byte; exit=1.

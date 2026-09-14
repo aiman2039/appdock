@@ -1,3 +1,0 @@
-review case=Startup accessibility=true
-Save Current Apps and Reset Saved App Choices persisted without changing live windows
-Startup config passed: restored minimized app on two launches, retained preference through release/quit, skipped rediscovery, and honored disabling
