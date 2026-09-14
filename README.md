@@ -8,7 +8,7 @@
 
 Keep your open app windows organized and switch between them with a click.
 
-**[Download for Mac](https://github.com/ohaddahan/appdock/releases)** · macOS 12 or later
+**[Download for Mac](https://github.com/aiman2039/appdock/releases)** · macOS 12 or later
 
 ## Features
 
@@ -33,7 +33,7 @@ Keep your open app windows organized and switch between them with a click.
 
 ## Get started
 
-1. Download the **DMG installer** for your Mac: **arm64** for Apple Silicon (M-series), or **x86_64** for Intel.
+1. Download the **universal DMG installer**. The same download runs natively on Apple Silicon and Intel Macs.
 2. Open the DMG and drag **AppDock** onto **Applications** in the installer window.
 3. Eject the installer, then open **AppDock** from Applications.
 4. Follow the setup wizard inside AppDock: verify Accessibility access, check available windows, and dock a window to test control.
@@ -46,6 +46,8 @@ Reopen the wizard from **AppDock → Setup & Diagnostics**. If Accessibility is 
 In **Settings**, choose which running apps to add next time. AppDock starts with an empty workspace until you choose startup apps.
 
 The release workflow signs and notarizes both the app and the DMG installer, and attaches Apple’s verification tickets for offline opening. ZIP downloads remain available as an alternative.
+
+Use **AppDock → Check for Updates…** for future releases. Automatic checks are optional; AppDock restores your managed windows before restarting to install an update. Older builds without Sparkle need one manual upgrade first.
 
 ## Good to know
 

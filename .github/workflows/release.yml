@@ -37,6 +37,12 @@ jobs:
           persist-credentials: false
       - name: Test release revision handling
         run: python3 scripts/test-release-revision.py
+      - name: Validate update signing configuration
+        env:
+          SPARKLE_PUBLIC_ED_KEY: ${{ vars.SPARKLE_PUBLIC_ED_KEY }}
+          SPARKLE_FEED_URL: https://github.com/${{ github.repository }}/releases/latest/download/appcast.xml
+          HAS_SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY != '' }}
+        run: python3 scripts/configure_updates.py --check
       - name: Read Cargo version and resolve release revision
         id: version
         env:
@@ -79,8 +85,40 @@ jobs:
           test "$(rustc -vV | sed -n 's/^host: //p')" = "$EXPECTED_TARGET"
       - name: Check and test
         run: ./scripts/check.sh
-      - name: Package release app
-        run: scripts/package.sh
+      - name: Build native release executable
+        run: cargo build --release --locked
+      - uses: actions/upload-artifact@v7
+        with:
+          name: native-${{ matrix.arch }}
+          path: target/release/appdock
+          if-no-files-found: error
+          retention-days: 1
+
+  package:
+    name: Package universal macOS release
+    needs: [prepare, build]
+    runs-on: macos-15
+    timeout-minutes: 70
+    env:
+      SPARKLE_PUBLIC_ED_KEY: ${{ vars.SPARKLE_PUBLIC_ED_KEY }}
+      SPARKLE_FEED_URL: https://github.com/${{ github.repository }}/releases/latest/download/appcast.xml
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.prepare.outputs.sha }}
+          persist-credentials: false
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: native-*
+          path: target/native
+      - name: Assemble universal executable
+        run: scripts/assemble-universal.sh target/native/native-arm64/appdock target/native/native-x86_64/appdock target/universal/appdock
+      - name: Fetch verified Sparkle SDK
+        run: |
+          sdk="$(scripts/fetch-sparkle.sh)"
+          echo "SPARKLE_SDK=$sdk" >> "$GITHUB_ENV"
+      - name: Package app with Sparkle
+        run: scripts/package.sh --prebuilt target/universal/appdock
       - name: Install disk image packaging tools
         run: |
           python3 -m venv "$RUNNER_TEMP/appdock-dmg-tools"
@@ -132,6 +170,12 @@ jobs:
             exit 1
           fi
           app="dist/AppDock.app"
+          # Sign inside-out; these helpers must carry our Developer ID too.
+          sparkle="$app/Contents/Frameworks/Sparkle.framework"
+          for component in "$sparkle/Versions/B/Autoupdate" "$sparkle/Versions/B/Updater.app" "$sparkle"; do
+            codesign --force --sign "$identity" --keychain "$keychain" \
+              --options runtime --timestamp "$component"
+          done
           for binary in AppDock; do
             codesign --force --sign "$identity" --keychain "$keychain" \
               --options runtime --timestamp "$app/Contents/MacOS/$binary"
@@ -183,31 +227,35 @@ jobs:
           rm -f "$RUNNER_TEMP/appdock-signing.p12" "$RUNNER_TEMP/appdock-notarization.zip"
       - name: Verify and archive release app
         env:
-          EXPECTED_ARCH: ${{ matrix.arch }}
           RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
         run: |
-          lipo dist/AppDock.app/Contents/MacOS/AppDock -verify_arch "$EXPECTED_ARCH"
+          lipo dist/AppDock.app/Contents/MacOS/AppDock -verify_arch arm64 x86_64
           codesign --verify --deep --strict dist/AppDock.app
-          scripts/verify-dmg.sh dist/AppDock.dmg "$EXPECTED_ARCH"
+          scripts/verify-dmg.sh dist/AppDock.dmg universal
           xcrun stapler validate dist/AppDock.dmg
           mkdir -p release-assets
-          installer="AppDock-${RELEASE_TAG}-macos-${EXPECTED_ARCH}.dmg"
+          installer="AppDock-${RELEASE_TAG}-macos-universal.dmg"
           mv dist/AppDock.dmg "release-assets/$installer"
-          archive="AppDock-${RELEASE_TAG}-macos-${EXPECTED_ARCH}.zip"
+          archive="AppDock-${RELEASE_TAG}-macos-universal.zip"
           ditto -c -k --sequesterRsrc --keepParent dist/AppDock.app "release-assets/$archive"
           cd release-assets
           shasum -a 256 "$archive" > "$archive.sha256"
           shasum -a 256 "$installer" > "$installer.sha256"
+      - name: Generate and verify signed update feed
+        env:
+          SPARKLE_PRIVATE_KEY: ${{ secrets.SPARKLE_PRIVATE_KEY }}
+          RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
+        run: scripts/generate-update-feed.sh release-assets "$RELEASE_TAG"
       - uses: actions/upload-artifact@v7
         with:
-          name: appdock-macos-${{ matrix.arch }}
+          name: appdock-macos-universal
           path: release-assets/*
           if-no-files-found: error
           retention-days: 7
 
   publish:
     name: Upload GitHub release assets
-    needs: [prepare, build]
+    needs: [prepare, package]
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     concurrency:
@@ -226,10 +274,9 @@ jobs:
       - name: Verify downloaded archives
         working-directory: release-assets
         run: |
-          test -f "AppDock-${RELEASE_TAG}-macos-arm64.dmg"
-          test -f "AppDock-${RELEASE_TAG}-macos-x86_64.dmg"
-          test -f "AppDock-${RELEASE_TAG}-macos-arm64.zip"
-          test -f "AppDock-${RELEASE_TAG}-macos-x86_64.zip"
+          test -f "AppDock-${RELEASE_TAG}-macos-universal.dmg"
+          test -f "AppDock-${RELEASE_TAG}-macos-universal.zip"
+          test -f appcast.xml
           sha256sum --check ./*.sha256
       - name: Create release if needed and upload assets
         env:

@@ -22,6 +22,14 @@ test -f "$mount_dir/.background.png"
 test "$(readlink "$mount_dir/Applications")" = /Applications
 codesign --verify --deep --strict --verbose=2 "$app"
 if [[ -n "$expected_arch" ]]; then
-  lipo "$app/Contents/MacOS/AppDock" -verify_arch "$expected_arch"
+  if [[ "$expected_arch" == universal ]]; then
+    lipo "$app/Contents/MacOS/AppDock" -verify_arch arm64 x86_64
+    sparkle="$app/Contents/Frameworks/Sparkle.framework/Versions/B"
+    for binary in "$sparkle/Sparkle" "$sparkle/Autoupdate" "$sparkle/Updater.app/Contents/MacOS/Updater"; do
+      lipo "$binary" -verify_arch arm64 x86_64
+    done
+  else
+    lipo "$app/Contents/MacOS/AppDock" -verify_arch "$expected_arch"
+  fi
 fi
 printf '%s\n' 'Installer contents, Applications shortcut, and app signature verified.'

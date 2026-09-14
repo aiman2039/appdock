@@ -645,6 +645,8 @@ pub fn start(workspace: Workspace) -> Client {
             if dirty || save_after.is_some_and(|t| Instant::now() >= t) {
                 save_after = None;
                 if let Err(e) = persistence::save(&persistence::path(), &engine.workspace) {
+                    // A relaunch (including Sparkle) must not proceed until state is durable.
+                    stopped = false;
                     status = format!("Could not save workspace: {e}");
                 }
             }

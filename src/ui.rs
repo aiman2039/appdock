@@ -230,6 +230,13 @@ struct Ivars {
     startup_menu: OnceCell<Retained<NSMenu>>,
     startup_menu_signature: RefCell<String>,
     settings_tracking: Cell<bool>,
+    updater: OnceCell<std::result::Result<crate::updater::Updater, String>>,
+    update_check_item: OnceCell<Retained<NSMenuItem>>,
+    update_auto_item: OnceCell<Retained<NSMenuItem>>,
+    update_install: RefCell<Option<block2::RcBlock<dyn Fn()>>>,
+    update_relaunch_in_progress: Cell<bool>,
+    update_smoke_callback: OnceCell<std::rc::Rc<Cell<bool>>>,
+    update_smoke_save_failure: Cell<bool>,
 }
 struct Ui {
     fixture: fixtures::FixtureState,
@@ -343,6 +350,24 @@ define_class!(
         #[unsafe(method(trackDrag:))] fn drag_timer(&self,_:&NSTimer){self.track_drag();}
         #[unsafe(method(tick:))] fn timer(&self,_:&NSTimer){self.tick();}
         #[unsafe(method(selectTab:))] fn select_tab(&self,sender:&NSButton){self.dismiss_picker(false);self.finish_rename(true);let mut b=self.ivars().ui.borrow_mut();if let Some(u)=b.as_mut(){let id=sender.tag() as u64;u.editing=Some(id);u.client.switch(id);}}
+        #[unsafe(method(validateMenuItem:))]
+        fn validate_menu_item(&self,item:&NSMenuItem)->bool {
+            if item.action()==Some(sel!(checkUpdates:)) {
+                self.ivars().updater.get().is_none_or(|u| u.as_ref().map_or(true,|u|u.can_check()))
+            } else if item.action()==Some(sel!(toggleAutomaticUpdates:)) {
+                self.ivars().updater.get().is_some_and(|u|u.is_ok())
+            } else { true }
+        }
+        #[unsafe(method(checkUpdates:))] fn check_updates_action(&self,_:&AnyObject){self.check_updates();}
+        #[unsafe(method(toggleAutomaticUpdates:))] fn automatic_updates_action(&self,_:&AnyObject){
+            if let Ok(updater)=self.ensure_updater(){updater.set_automatic_checks(!updater.automatic_checks());}
+        }
+        #[unsafe(method(updater:shouldPostponeRelaunchForUpdate:untilInvokingBlock:))]
+        fn postpone_update(&self,_:&AnyObject,_:&AnyObject,handler:&block2::Block<dyn Fn()>)->bool {
+            *self.ivars().update_install.borrow_mut()=Some(handler.copy());
+            self.close_request();
+            true
+        }
         #[unsafe(method(showSetup:))] fn show_setup_action(&self,_:&AnyObject){self.show_setup();}
         #[unsafe(method(setupNext:))] fn next_setup_action(&self,_:&AnyObject){self.setup_next();}
         #[unsafe(method(setupBack:))] fn back_setup_action(&self,_:&AnyObject){self.setup_back();}
@@ -799,6 +824,33 @@ impl Delegate {
         unsafe {
             setup_item.setTarget(Some(self));
         }
+        for (title, action, slot) in [
+            (
+                "Check for Updates…",
+                sel!(checkUpdates:),
+                &self.ivars().update_check_item,
+            ),
+            (
+                "Automatically Check for Updates",
+                sel!(toggleAutomaticUpdates:),
+                &self.ivars().update_auto_item,
+            ),
+        ] {
+            let item = unsafe {
+                NSMenuItem::initWithTitle_action_keyEquivalent(
+                    NSMenuItem::alloc(m),
+                    &NSString::from_str(title),
+                    Some(action),
+                    &NSString::from_str(""),
+                )
+            };
+            unsafe {
+                item.setTarget(Some(self));
+            }
+            submenu.addItem(&item);
+            let _ = slot.set(item);
+        }
+        submenu.addItem(&NSMenuItem::separatorItem(m));
         submenu.addItem(&setup_item);
         submenu.addItem(&settings_item);
         submenu.addItem(&startup_item);
@@ -1125,6 +1177,87 @@ impl Delegate {
         }
     }
     fn tick(&self) {
+        if std::env::args().any(|a| a == "--updater-smoke") {
+            let waiting = self.ivars().ui.borrow().as_ref().and_then(|u| {
+                let s = u.client.snapshot.lock().unwrap();
+                (s.quitting && !s.stopped).then(|| (u.client.clone(), s.status.clone()))
+            });
+            if let Some((client, status)) = waiting {
+                if status.starts_with("Could not save workspace:")
+                    && !self.ivars().update_smoke_save_failure.replace(true)
+                {
+                    assert!(!self.ivars().update_smoke_callback.get().unwrap().get());
+                    std::fs::remove_dir(persistence::path().with_extension("json.tmp")).unwrap();
+                    client.send(Command::Quit);
+                }
+                return;
+            }
+            if self
+                .ivars()
+                .update_smoke_callback
+                .get()
+                .is_some_and(|flag| flag.get())
+            {
+                let restored = self.ivars().ui.borrow().as_ref().is_some_and(|u| {
+                    let s = u.client.snapshot.lock().unwrap();
+                    s.stopped && s.restore_pending == 0
+                });
+                assert!(restored, "Sparkle resumed before restoration completed");
+                assert!(
+                    self.ivars().update_smoke_save_failure.get(),
+                    "Save failure was not exercised"
+                );
+                println!(
+                    "Sparkle native smoke passed: framework loaded, checks available, relaunch blocked by failed save, callback retained and resumed after successful retry"
+                );
+                NSApplication::sharedApplication(self.mtm()).terminate(None);
+                return;
+            }
+            if self.ivars().ticks.get() == 8 {
+                assert!(
+                    self.ensure_updater()
+                        .expect("Sparkle failed to initialize")
+                        .can_check()
+                );
+                // Fail only this isolated fixture's next atomic save, then retry it.
+                std::fs::create_dir(persistence::path().with_extension("json.tmp")).unwrap();
+                let flag = std::rc::Rc::new(Cell::new(false));
+                let signal = flag.clone();
+                let handler = block2::RcBlock::new(move || signal.set(true));
+                let _ = self.ivars().update_smoke_callback.set(flag.clone());
+                let dummy = NSObject::new();
+                let postponed: bool = unsafe {
+                    msg_send![self, updater: &*dummy,
+                    shouldPostponeRelaunchForUpdate: &*dummy, untilInvokingBlock: &*handler]
+                };
+                assert!(postponed);
+                assert!(!flag.get(), "Relaunch was not deferred");
+            }
+        }
+
+        let ready_for_updates = self.ivars().ui.borrow().as_ref().is_some_and(|u| {
+            let s = u.client.snapshot.lock().unwrap();
+            s.workspace.onboarding_completed
+                && s.trusted
+                && !s.quitting
+                && !u.setup_wizard.as_ref().is_some_and(|setup| setup.visible())
+        });
+        if ready_for_updates {
+            let _ = self.ensure_updater();
+        }
+        if let Some(Ok(updater)) = self.ivars().updater.get() {
+            if let Some(item) = self.ivars().update_check_item.get() {
+                item.setEnabled(updater.can_check());
+            }
+            if let Some(item) = self.ivars().update_auto_item.get() {
+                item.setState(if updater.automatic_checks() {
+                    NSControlStateValueOn
+                } else {
+                    NSControlStateValueOff
+                });
+            }
+        }
+
         let show_setup = self.ivars().ui.borrow().as_ref().is_some_and(|u| {
             !u.setup_auto_shown && self.ivars().ticks.get() > 1 && {
                 let s = u.client.snapshot.lock().unwrap();
@@ -1347,7 +1480,14 @@ impl Delegate {
             let window = u.window.clone();
             drop(b);
             window.orderOut(None);
-            NSApplication::sharedApplication(self.mtm()).terminate(None);
+            let install = self.ivars().update_install.borrow_mut().take();
+            if let Some(install) = install {
+                // Sparkle can request termination only after all restoration IPC succeeded.
+                self.ivars().update_relaunch_in_progress.set(true);
+                install.call(());
+            } else if !self.ivars().update_relaunch_in_progress.get() {
+                NSApplication::sharedApplication(self.mtm()).terminate(None);
+            }
             return;
         }
         u.permission_button.setHidden(setup_visible || s.trusted);
@@ -1907,6 +2047,26 @@ impl Delegate {
                 editor.field.removeFromSuperview();
             }
             client.set_text_editing(false);
+        }
+    }
+    fn ensure_updater(&self) -> std::result::Result<&crate::updater::Updater, &String> {
+        self.ivars()
+            .updater
+            .get_or_init(|| {
+                crate::updater::Updater::load(self.mtm(), self).inspect(|updater| updater.start())
+            })
+            .as_ref()
+    }
+    fn check_updates(&self) {
+        match self.ensure_updater() {
+            Ok(updater) if updater.can_check() => updater.check(),
+            Ok(_) => {}
+            Err(error) => {
+                let alert = NSAlert::new(self.mtm());
+                alert.setMessageText(&NSString::from_str("Updates unavailable"));
+                alert.setInformativeText(&NSString::from_str(error));
+                alert.runModal();
+            }
         }
     }
     fn close_request(&self) {

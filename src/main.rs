@@ -19,6 +19,8 @@ mod startup;
 #[cfg(target_os = "macos")]
 mod ui;
 #[cfg(target_os = "macos")]
+mod updater;
+#[cfg(target_os = "macos")]
 mod window_tracking;
 #[cfg(target_os = "macos")]
 mod worker;
@@ -91,7 +93,8 @@ fn main() {
             if matches!(
                 arg.as_deref(),
                 Some(
-                    "--ui-smoke"
+                    "--updater-smoke"
+                        | "--ui-smoke"
                         | "--surface-smoke"
                         | "--dock-smoke"
                         | "--picker-smoke"
