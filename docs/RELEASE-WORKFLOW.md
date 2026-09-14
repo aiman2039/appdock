@@ -1,7 +1,5 @@
 # Release workflow fix — 2026-09-10
 
-[Run 34497705015](https://github.com/ohaddahan/appdock/actions/runs/34497705015/job/102940280896) failed in checkout before Rust ran: it tried to fetch the nonexistent `refs/tags/v0.1.0` supplied as a manual input. [Failure excerpt](review-evidence/release-workflow/failure.log).
-
 The release workflow now has **only `workflow_dispatch`**, with no version/tag input. It checks out the selected immutable revision, reads `[package].version` from Cargo.toml, and derives its tag. Missing tags are created during a manual run; existing tags must point to the same commit. Both macOS architectures build that exact SHA. Release assets are published only after both builds succeed. Pushes, tag pushes, and release-publication events do not start this workflow.
 
 Both workflows use `Swatinem/rust-cache@v2` after installing their toolchains. Release keys separate native architecture/runner; check keys separate OS/architecture. The action includes compiler and Cargo dependency state automatically. Deployment target and SDK environment are included, and cached tool binaries are disabled. Manual release runs on the same branch can reuse their caches. No automatic release/cache-warming runs were added. [Cache action reference](https://github.com/Swatinem/rust-cache).

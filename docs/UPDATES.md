@@ -6,7 +6,7 @@ Sparkle 2.10.0 is downloaded from its official release with a pinned SHA-256 dig
 
 ## One-time signing setup
 
-Run these commands yourself in a normal macOS terminal. Do not send the private key in chat or commit it. Configure the publishing repository, `aiman2039/appdock`. GitHub currently redirects the old `ohaddahan/appdock` origin to this repository.
+Run these commands yourself in a normal macOS terminal. Do not send the private key in chat or commit it. Configure the publishing repository, `aiman2039/appdock`. GitHub currently redirects the old `appdock` origin to this repository.
 
 1. Download the pinned SDK and generate an AppDock signing key in your login Keychain. This reuses an existing key for the same account rather than replacing it:
 
