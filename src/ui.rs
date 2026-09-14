@@ -362,6 +362,22 @@ define_class!(
         #[unsafe(method(toggleAutomaticUpdates:))] fn automatic_updates_action(&self,_:&AnyObject){
             if let Ok(updater)=self.ensure_updater(){updater.set_automatic_checks(!updater.automatic_checks());}
         }
+        #[unsafe(method(updaterShouldPromptForPermissionToCheckForUpdates:))]
+        fn update_permission_prompt(&self,_:&AnyObject)->bool { false }
+        #[unsafe(method(updater:didFindValidUpdate:))]
+        fn update_found(&self,_:&AnyObject,item:&AnyObject) {
+            if let Some(Ok(updater)) = self.ivars().updater.get() && updater.probing.get() {
+                let version: Retained<NSString> = unsafe { msg_send![item, versionString] };
+                *updater.pending.borrow_mut() = Some(version.to_string());
+            }
+        }
+        #[unsafe(method(updater:didFinishUpdateCycleForUpdateCheck:error:))]
+        fn update_cycle_finished(&self,_:&AnyObject,_:isize,error:Option<&AnyObject>) {
+            if let Some(Ok(updater)) = self.ivars().updater.get() {
+                updater.probing.set(false);
+                if error.is_some() { updater.pending.borrow_mut().take(); }
+            }
+        }
         #[unsafe(method(updater:shouldPostponeRelaunchForUpdate:untilInvokingBlock:))]
         fn postpone_update(&self,_:&AnyObject,_:&AnyObject,handler:&block2::Block<dyn Fn()>)->bool {
             *self.ivars().update_install.borrow_mut()=Some(handler.copy());
@@ -1239,15 +1255,33 @@ impl Delegate {
 
         let ready_for_updates = self.ivars().ui.borrow().as_ref().is_some_and(|u| {
             let s = u.client.snapshot.lock().unwrap();
-            s.workspace.onboarding_completed
-                && s.trusted
-                && !s.quitting
-                && !u.setup_wizard.as_ref().is_some_and(|setup| setup.visible())
+            !s.quitting && !u.setup_wizard.as_ref().is_some_and(|setup| setup.visible())
         });
-        if ready_for_updates {
+        if self.ivars().ticks.get() > 1 && !std::env::args().any(|arg| arg.ends_with("-smoke")) {
             let _ = self.ensure_updater();
         }
         if let Some(Ok(updater)) = self.ivars().updater.get() {
+            let quitting = self
+                .ivars()
+                .ui
+                .borrow()
+                .as_ref()
+                .is_none_or(|u| u.client.snapshot.lock().unwrap().quitting);
+            if !quitting {
+                updater.poll();
+            }
+            if ready_for_updates && let Some(version) = updater.notification() {
+                let alert = NSAlert::new(self.mtm());
+                alert.setMessageText(&NSString::from_str("AppDock update available"));
+                alert.setInformativeText(&NSString::from_str(&format!(
+                    "Version {version} is ready.\nWould you like to review the update?"
+                )));
+                alert.addButtonWithTitle(&NSString::from_str("Review Update"));
+                alert.addButtonWithTitle(&NSString::from_str("Later"));
+                if alert.runModal() == 1000 {
+                    self.check_updates();
+                }
+            }
             if let Some(item) = self.ivars().update_check_item.get() {
                 item.setEnabled(updater.can_check());
             }

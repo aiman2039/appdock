@@ -46,3 +46,40 @@ mod tests {
         assert_eq!(clock.due(delayed + DISCOVER, false), (true, true));
     }
 }
+
+/// Probe immediately, then once per minute; busy sessions do not consume a deadline.
+#[derive(Default)]
+pub struct UpdateSchedule {
+    next: Duration,
+}
+impl UpdateSchedule {
+    pub fn due(&mut self, now: Duration, enabled: bool, available: bool) -> bool {
+        if !enabled || !available || now < self.next {
+            return false;
+        }
+        self.next = now + Duration::from_secs(60);
+        true
+    }
+    pub fn reset(&mut self) {
+        self.next = Duration::ZERO;
+    }
+}
+#[cfg(test)]
+mod update_tests {
+    use super::*;
+    #[test]
+    fn minute_polling_handles_disabled_busy_and_sleep_without_bursts() {
+        let mut s = UpdateSchedule::default();
+        assert!(!s.due(Duration::ZERO, false, true));
+        assert!(!s.due(Duration::ZERO, true, false));
+        assert!(s.due(Duration::ZERO, true, true));
+        assert!(!s.due(Duration::from_secs(59), true, true));
+        assert!(s.due(Duration::from_secs(60), true, true));
+        assert!(!s.due(Duration::from_secs(120), true, false));
+        assert!(s.due(Duration::from_secs(121), true, true));
+        assert!(s.due(Duration::from_secs(600), true, true));
+        assert!(!s.due(Duration::from_secs(600), true, true));
+        s.reset();
+        assert!(s.due(Duration::from_secs(601), true, true));
+    }
+}

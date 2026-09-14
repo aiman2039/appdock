@@ -61,3 +61,11 @@ The app requires signed feeds and verifies update signatures before extraction. 
 Local development installers are ad-hoc signed and are not production release evidence. Test an actual update between two Developer ID signed, notarized releases on a separate Mac before considering the hosted installation/relaunch path verified.
 
 References: [Sparkle integration](https://sparkle-project.org/documentation/), [manual signing](https://sparkle-project.org/documentation/sandboxing/#code-signing), [update publishing](https://sparkle-project.org/documentation/publishing/), [universal macOS binaries](https://developer.apple.com/documentation/apple-silicon/building-a-universal-macos-binary).
+
+### Automatic checks and installation setup
+
+AppDock probes Sparkle immediately after updater initialization, then every 60 seconds while running. It uses `checkForUpdateInformation`, leaving feed verification and version eligibility to Sparkle. The separate Sparkle scheduled checks are disabled to avoid competing timers. A busy update session defers the next probe; wake from sleep does not trigger catch-up bursts. Network errors and up-to-date results stay silent. Each new version triggers one popup per app session, deferred while setup is visible. Review Update opens Sparkle's interactive flow; Later dismisses the popup for that session. Installation still requires user action.
+
+Automatic checks default on. Existing explicit Sparkle opt-outs are migrated to `AppDockAutomaticUpdateChecks`; the AppDock menu persists future choices there.
+
+Installed copies in `/Applications` or `~/Applications` skip the installation step, including after updates. Other copies open Finder at the source app and, when needed, Applications, so the actual app can be dragged. They stay on installation until the user quits and opens the installed copy.

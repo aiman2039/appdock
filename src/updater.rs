@@ -1,11 +1,20 @@
 //! Sparkle is loaded only from the signed app's embedded Frameworks directory.
 //! This keeps plain `cargo run` and deterministic tests independent of the SDK.
 use objc2::{msg_send, rc::Retained, runtime::AnyObject};
-use objc2_foundation::{MainThreadMarker, NSBundle, NSString};
+use objc2_foundation::{MainThreadMarker, NSBundle, NSString, NSUserDefaults};
+use std::{
+    cell::{Cell, RefCell},
+    time::Instant,
+};
 
 pub struct Updater {
     _framework: Retained<NSBundle>,
     controller: Retained<AnyObject>,
+    schedule: RefCell<crate::schedule::UpdateSchedule>,
+    started: Instant,
+    pub probing: Cell<bool>,
+    pub pending: RefCell<Option<String>>,
+    notified: RefCell<std::collections::HashSet<String>>,
 }
 impl Updater {
     pub fn load(_main: MainThreadMarker, delegate: &AnyObject) -> Result<Self, String> {
@@ -43,10 +52,25 @@ impl Updater {
         Ok(Self {
             _framework: framework,
             controller,
+            schedule: RefCell::new(Default::default()),
+            started: Instant::now(),
+            probing: Cell::new(false),
+            pending: RefCell::new(None),
+            notified: RefCell::new(Default::default()),
         })
     }
     pub fn start(&self) {
+        let defaults = NSUserDefaults::standardUserDefaults();
+        let key = NSString::from_str("AppDockAutomaticUpdateChecks");
+        if defaults.objectForKey(&key).is_none() {
+            let old = NSString::from_str("SUEnableAutomaticChecks");
+            let enabled = defaults.objectForKey(&old).is_none() || defaults.boolForKey(&old);
+            defaults.setBool_forKey(enabled, &key);
+        }
         unsafe {
+            // AppDock owns the 60-second probe schedule; disable Sparkle's separate timer.
+            let updater: Retained<AnyObject> = msg_send![&*self.controller, updater];
+            let _: () = msg_send![&*updater, setAutomaticallyChecksForUpdates: false];
             let _: () = msg_send![&*self.controller, startUpdater];
         }
     }
@@ -62,15 +86,39 @@ impl Updater {
         }
     }
     pub fn automatic_checks(&self) -> bool {
-        unsafe {
-            let updater: Retained<AnyObject> = msg_send![&*self.controller, updater];
-            msg_send![&*updater, automaticallyChecksForUpdates]
-        }
+        NSUserDefaults::standardUserDefaults()
+            .boolForKey(&NSString::from_str("AppDockAutomaticUpdateChecks"))
     }
     pub fn set_automatic_checks(&self, enabled: bool) {
+        NSUserDefaults::standardUserDefaults()
+            .setBool_forKey(enabled, &NSString::from_str("AppDockAutomaticUpdateChecks"));
+        self.schedule.borrow_mut().reset();
+        if !enabled {
+            self.pending.borrow_mut().take();
+        }
+    }
+    pub fn poll(&self) {
+        if !self.schedule.borrow_mut().due(
+            self.started.elapsed(),
+            self.automatic_checks(),
+            self.can_check(),
+        ) {
+            return;
+        }
+        self.probing.set(true);
         unsafe {
             let updater: Retained<AnyObject> = msg_send![&*self.controller, updater];
-            let _: () = msg_send![&*updater, setAutomaticallyChecksForUpdates: enabled];
+            let _: () = msg_send![&*updater, checkForUpdateInformation];
         }
+    }
+    pub fn notification(&self) -> Option<String> {
+        if !self.automatic_checks() || self.probing.get() || !self.can_check() {
+            return None;
+        }
+        let version = self.pending.borrow_mut().take()?;
+        self.notified
+            .borrow_mut()
+            .insert(version.clone())
+            .then_some(version)
     }
 }

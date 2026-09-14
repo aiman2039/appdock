@@ -106,7 +106,11 @@ impl SetupUi {
             secondary,
             back,
             copy,
-            step: Step::Install,
+            step: if crate::onboarding::running_installed() {
+                Step::Permission
+            } else {
+                Step::Install
+            },
             generation: 0,
             waiting: false,
             finishing: false,
@@ -195,6 +199,7 @@ impl Delegate {
     pub(super) fn show_setup(&self) {
         self.dismiss_picker(false);
         self.finish_rename(true);
+        let mut open_installer = false;
         let window = {
             let mut borrow = self.ivars().ui.borrow_mut();
             let Some(u) = borrow.as_mut() else { return };
@@ -204,12 +209,17 @@ impl Delegate {
             u.raise_after = None;
             if u.setup_wizard.is_none() {
                 let setup = SetupUi::new(self);
+                open_installer = setup.step == Step::Install;
                 u.surface.addSubview(&setup.view);
                 u.setup_wizard = Some(setup);
             }
             let setup = u.setup_wizard.as_mut().unwrap();
             if !setup.visible() && !setup.test_started && setup.finishing {
-                setup.step = Step::Install;
+                setup.step = if crate::onboarding::running_installed() {
+                    Step::Permission
+                } else {
+                    Step::Install
+                };
                 setup.finishing = false;
             }
             setup.layout(rect(
@@ -230,6 +240,9 @@ impl Delegate {
         NSApplication::sharedApplication(self.mtm()).activateIgnoringOtherApps(true);
         window.makeKeyAndOrderFront(None);
         self.refresh_setup();
+        if open_installer {
+            self.open_installation();
+        }
     }
     pub(super) fn hide_setup(&self) {
         let mut borrow = self.ivars().ui.borrow_mut();
@@ -251,6 +264,9 @@ impl Delegate {
             && let Some(setup) = u.setup_wizard.as_mut()
         {
             setup.step = setup.step.back();
+            if setup.step == Step::Install && crate::onboarding::running_installed() {
+                setup.step = Step::Permission;
+            }
             setup.scroll_to_top();
             setup.waiting = false;
             setup.finishing = false;
@@ -258,9 +274,7 @@ impl Delegate {
         self.refresh_setup();
     }
     pub(super) fn setup_next(&self) {
-        let installer_copy =
-            std::env::current_exe().is_ok_and(|p| crate::onboarding::from_installer(&p));
-        if installer_copy
+        if !crate::onboarding::running_installed()
             && self
                 .ivars()
                 .ui
@@ -270,7 +284,6 @@ impl Delegate {
                 .is_some_and(|s| s.step == Step::Install)
         {
             self.setup_action();
-            self.close_request();
             return;
         }
         let mut choose = false;
@@ -333,17 +346,31 @@ impl Delegate {
             .and_then(|u| u.setup_wizard.as_ref())
             .map(|s| s.step);
         match step {
-            Some(Step::Install) => {
-                let url =
-                    objc2_foundation::NSURL::fileURLWithPath(&NSString::from_str("/Applications"));
-                NSWorkspace::sharedWorkspace().openURL(&url);
-            }
+            Some(Step::Install) => self.open_installation(),
             Some(Step::Permission) => self.open_accessibility(),
             Some(Step::Verify) => {
                 self.verify_setup();
                 self.refresh_setup();
             }
             _ => {}
+        }
+    }
+    fn open_installation(&self) {
+        // Finder owns the draggable app, never an illustration inside the wizard.
+        if let Ok(path) = std::env::current_exe() {
+            let app = crate::onboarding::running_app(&path);
+            if let Some(folder) = app.parent() {
+                let url = objc2_foundation::NSURL::fileURLWithPath(&NSString::from_str(
+                    &folder.display().to_string(),
+                ));
+                NSWorkspace::sharedWorkspace().openURL(&url);
+                if !folder.join("Applications").exists() {
+                    let destination = objc2_foundation::NSURL::fileURLWithPath(
+                        &NSString::from_str("/Applications"),
+                    );
+                    NSWorkspace::sharedWorkspace().openURL(&destination);
+                }
+            }
         }
     }
     pub(super) fn open_accessibility(&self) {
@@ -394,8 +421,13 @@ impl Delegate {
                 }
             }
             setup.progress.setStringValue(&NSString::from_str(&format!(
-                "STEP {} OF 5  ·  APPDOCK SETUP",
-                setup.step.number()
+                "STEP {} OF {}  ·  APPDOCK SETUP",
+                setup.step.number() - usize::from(crate::onboarding::running_installed()),
+                if crate::onboarding::running_installed() {
+                    4
+                } else {
+                    5
+                }
             )));
             let path = std::env::current_exe()
                 .ok()
@@ -411,7 +443,7 @@ impl Delegate {
             let (title, detail, result, primary, secondary, enabled) = match setup.step {
                 Step::Install => (
                     "Install AppDock",
-                    "Drag AppDock.app onto Applications in the installer window.\nThen eject the installer and open AppDock from Applications.\nAlready downloaded a ZIP? Move its AppDock.app into Applications first.",
+                    "Drag the real AppDock.app in Finder into Applications.\nFor a ZIP download, drag between the two Finder windows.\nThen quit this copy and open AppDock from Applications.",
                     format!(
                         "{}\nRunning copy (v{}):\n{path}",
                         if installed {
@@ -423,12 +455,8 @@ impl Delegate {
                         },
                         env!("CARGO_PKG_VERSION")
                     ),
-                    if installer_copy {
-                        "Quit & open Applications"
-                    } else {
-                        "Continue"
-                    },
-                    "Open Applications",
+                    "Open installer in Finder",
+                    "",
                     true,
                 ),
                 Step::Permission => (
@@ -524,9 +552,11 @@ impl Delegate {
             setup.secondary.setTitle(&NSString::from_str(secondary));
             setup.secondary.setHidden(secondary.is_empty());
             setup.secondary.setEnabled(!setup.waiting);
-            setup
-                .back
-                .setEnabled(setup.step != Step::Install && !setup.finishing);
+            setup.back.setEnabled(
+                setup.step != Step::Install
+                    && !(setup.step == Step::Permission && crate::onboarding::running_installed())
+                    && !setup.finishing,
+            );
         }
         if close {
             self.hide_setup();

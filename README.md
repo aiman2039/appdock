@@ -47,7 +47,7 @@ In **Settings**, choose which running apps to add next time. AppDock starts with
 
 The release workflow signs and notarizes both the app and the DMG installer, and attaches Apple’s verification tickets for offline opening. ZIP downloads remain available as an alternative.
 
-Use **AppDock → Check for Updates…** for future releases. Automatic checks are optional; AppDock restores your managed windows before restarting to install an update. Older builds without Sparkle need one manual upgrade first.
+Use **AppDock → Check for Updates…** for future releases. AppDock checks for updates every 60 seconds while running and shows a popup once per new version per session. You can turn automatic checks off from the AppDock menu; AppDock restores your managed windows before restarting to install an update. Older builds without Sparkle need one manual upgrade first.
 
 ## Good to know
 

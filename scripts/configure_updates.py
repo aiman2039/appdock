@@ -34,7 +34,7 @@ def configure(bundle, public_key, feed):
         SUAllowsAutomaticUpdates=False,
         SUEnableSystemProfiling=False,
     )
-    # Retain Sparkle's user choice for automatic checks (default prompt on second launch).
+    # AppDock migrates Sparkle's existing preference and owns its 60-second probe timer.
     with path.open("wb") as file:
         plistlib.dump(info, file)
 

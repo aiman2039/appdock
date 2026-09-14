@@ -62,6 +62,24 @@ pub fn from_installer(path: &std::path::Path) -> bool {
             .any(|part| part.as_os_str() == "AppTranslocation")
 }
 
+pub fn installed(path: &std::path::Path, home: Option<&std::path::Path>) -> bool {
+    running_app(path)
+        .extension()
+        .is_some_and(|ext| ext == "app")
+        && (path.starts_with("/Applications")
+            || home.is_some_and(|home| path.starts_with(home.join("Applications"))))
+}
+pub fn running_installed() -> bool {
+    std::env::current_exe().is_ok_and(|path| {
+        installed(
+            &path,
+            std::env::var_os("HOME")
+                .as_deref()
+                .map(std::path::Path::new),
+        )
+    })
+}
+
 /// Reveal the enclosing app bundle, or the executable for development launches.
 pub fn running_app(path: &std::path::Path) -> &std::path::Path {
     path.ancestors()
@@ -117,6 +135,26 @@ pub fn signing_metadata(output: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn installed_detection_covers_updates_and_rejects_downloads() {
+        use std::path::Path;
+        let home = Some(Path::new("/Users/example"));
+        for path in [
+            "/Applications/AppDock.app/Contents/MacOS/AppDock",
+            "/Users/example/Applications/AppDock.app/Contents/MacOS/AppDock",
+        ] {
+            assert!(installed(Path::new(path), home));
+        }
+        for path in [
+            "/Applications-copy/AppDock.app/Contents/MacOS/AppDock",
+            "/Volumes/Install AppDock/AppDock.app/Contents/MacOS/AppDock",
+            "/Users/example/Downloads/AppDock.app/Contents/MacOS/AppDock",
+            "/tmp/target/debug/appdock",
+        ] {
+            assert!(!installed(Path::new(path), home));
+        }
+    }
+
     #[test]
     fn picker_explains_permission_before_search_or_old_results() {
         assert!(picker_message(false, true, false, 5, true).contains("doesn’t have window access"));
