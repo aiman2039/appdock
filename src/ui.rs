@@ -20,7 +20,7 @@ use objc2::{
 use objc2_app_kit::*;
 use objc2_foundation::{
     MainThreadMarker, NSAttributedString, NSData, NSDictionary, NSNotification, NSObject,
-    NSObjectProtocol, NSPoint, NSRect, NSSize, NSString, NSTimer,
+    NSObjectProtocol, NSPoint, NSRect, NSSize, NSString, NSTimer, NSURL,
 };
 use std::{
     cell::{Cell, OnceCell, RefCell},
@@ -397,6 +397,7 @@ define_class!(
             true
         }
         #[unsafe(method(showSetup:))] fn show_setup_action(&self,_:&AnyObject){self.show_setup();}
+        #[unsafe(method(openLogs:))] fn open_logs_action(&self,_:&AnyObject){self.open_logs();}
         #[unsafe(method(setupNext:))] fn next_setup_action(&self,_:&AnyObject){self.setup_next();}
         #[unsafe(method(setupBack:))] fn back_setup_action(&self,_:&AnyObject){self.setup_back();}
         #[unsafe(method(setupAction:))] fn setup_secondary_action(&self,_:&AnyObject){self.setup_action();}
@@ -471,12 +472,29 @@ impl Delegate {
             b
         }
     }
+    fn open_logs(&self) {
+        let directory = crate::event_log::directory();
+        let _ = std::fs::create_dir_all(&directory);
+        let url = NSURL::fileURLWithPath(&NSString::from_str(&directory.to_string_lossy()));
+        let _ = NSWorkspace::sharedWorkspace().openURL(&url);
+    }
     fn setup(&self) {
         let m = self.mtm();
         theme::install_font();
         let app = NSApplication::sharedApplication(m);
         let mut workspace = match persistence::load_for_launch(&persistence::path()) {
-            Ok(w) => w,
+            Ok(w) => {
+                crate::event_log::emit(
+                    "process_start",
+                    serde_json::json!({
+                        "version": env!("CARGO_PKG_VERSION"),
+                        "exe": std::env::current_exe()
+                            .ok()
+                            .and_then(|path| path.into_os_string().into_string().ok()),
+                    }),
+                );
+                w
+            }
             Err(e) => {
                 let a = NSAlert::new(m);
                 a.setMessageText(&NSString::from_str("AppDock could not open this workspace"));
@@ -899,6 +917,17 @@ impl Delegate {
         unsafe {
             setup_item.setTarget(Some(self));
         }
+        let logs_item = unsafe {
+            NSMenuItem::initWithTitle_action_keyEquivalent(
+                NSMenuItem::alloc(m),
+                &NSString::from_str("Open Logs"),
+                Some(sel!(openLogs:)),
+                &NSString::from_str(""),
+            )
+        };
+        unsafe {
+            logs_item.setTarget(Some(self));
+        }
         for (title, action, slot) in [
             (
                 "Check for Updates…",
@@ -927,6 +956,7 @@ impl Delegate {
         }
         submenu.addItem(&NSMenuItem::separatorItem(m));
         submenu.addItem(&setup_item);
+        submenu.addItem(&logs_item);
         submenu.addItem(&settings_item);
         submenu.addItem(&startup_item);
         submenu.addItem(&NSMenuItem::separatorItem(m));

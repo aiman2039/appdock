@@ -4,6 +4,7 @@ use crate::{
     model::*,
     persistence,
 };
+use serde_json::json;
 use std::{
     collections::VecDeque,
     sync::{
@@ -639,7 +640,7 @@ pub fn start(workspace: Workspace) -> Client {
                 }
                 Some(Command::RetryRestoration) => engine.retry_released(),
                 Some(Command::Pause) => {
-                    engine.paused = Some("Desktop changed".into());
+                    engine.pause_for("Desktop changed");
                     apply_geometry(&mut engine, geometry, false)
                 }
                 Some(Command::Resume) => apply_geometry(&mut engine, geometry, false)
@@ -770,11 +771,25 @@ pub fn start(workspace: Workspace) -> Client {
                 }
             }
             if dirty || save_after.is_some_and(|t| Instant::now() >= t) {
+                let log_tabs = dirty;
                 save_after = None;
                 if let Err(e) = persistence::save(&persistence::path(), &engine.workspace) {
                     // A relaunch (including Sparkle) must not proceed until state is durable.
                     stopped = false;
                     status = format!("Could not save workspace: {e}");
+                } else if log_tabs {
+                    crate::event_log::emit(
+                        "tabs_saved",
+                        json!({
+                            "live": engine.live.len(),
+                            "tabs": engine
+                                .workspace
+                                .tabs
+                                .iter()
+                                .map(|tab| json!({"id": tab.id, "bundle": tab.identity.bundle}))
+                                .collect::<Vec<_>>(),
+                        }),
+                    );
                 }
             }
             if next_observe <= Instant::now() {

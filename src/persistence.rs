@@ -1,4 +1,5 @@
 use crate::model::*;
+use serde_json::json;
 use std::{
     fs,
     path::{Path, PathBuf},
@@ -48,6 +49,16 @@ pub fn load(path: &Path) -> Result<Workspace> {
 pub fn load_for_launch(path: &Path) -> Result<Workspace> {
     let mut workspace = load(path)?;
     if !workspace.tabs.is_empty() {
+        crate::event_log::emit(
+            "session_cleared",
+            json!({
+                "tabs": workspace
+                    .tabs
+                    .iter()
+                    .map(|tab| json!({"id": tab.id, "bundle": tab.identity.bundle}))
+                    .collect::<Vec<_>>(),
+            }),
+        );
         workspace.tabs.clear();
         save(path, &workspace)?;
     }

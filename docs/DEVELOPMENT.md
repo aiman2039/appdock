@@ -54,6 +54,14 @@ Version 1 JSON is saved atomically to:
 ~/Library/Application Support/AppDock/workspace.json
 ```
 
+Attachment lifecycle events (attach, release, closed, pause, startup cancel, launch) append to:
+
+```text
+~/Library/Logs/AppDock/events.jsonl
+```
+
+Use **AppDock → Open Logs** after a drop. Isolated `APPDOCK_DATA_DIR` workspaces write `events.jsonl` in that directory. The file rotates at 1 MB. Window titles are not logged.
+
 `APPDOCK_DATA_DIR` selects an isolated state directory. A file lock prevents two managers from opening the same workspace. Unknown versions, malformed state, and duplicate tab IDs are rejected without replacing the original JSON.
 
 By default, every launch starts with **no attached apps**, including `cargo run`. Opt in per app through **Settings** beside **Add App** to add detected windows automatically. Startup validates the saved workspace, clears any previous session’s tabs before window discovery, and saves that empty tab list. Window size, position, keyboard shortcuts, and startup app choices are preserved. A saved Terminal window is never automatically reattached just because it has a stable Accessibility identifier.

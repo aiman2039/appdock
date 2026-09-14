@@ -154,9 +154,22 @@ pub enum Restoration {
     Exact,
     Adjusted { requested: Rect, actual: Rect },
 }
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ClosedInfo {
+    pub window: WindowId,
+    pub pid: i32,
+    pub bundle: String,
+    pub process_exited: bool,
+    pub ax_window_count: Option<usize>,
+    pub exact: bool,
+    pub identifier: Option<String>,
+    pub owners: usize,
+    pub reason: String,
+}
+
 #[derive(Clone, Debug)]
 pub enum BackendEvent {
-    Closed(WindowId),
+    Closed(ClosedInfo),
     Changed(WindowId),
     PermissionLost,
 }

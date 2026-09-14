@@ -23,6 +23,13 @@ impl Startup {
         self.pending.pop_front()
     }
     pub fn cancel(&mut self) {
+        let remaining = self.pending.len() + self.apps.as_ref().map_or(0, Vec::len);
+        if remaining > 0 {
+            crate::event_log::emit(
+                "startup_cancelled",
+                serde_json::json!({"remaining": remaining}),
+            );
+        }
         self.apps = None;
         self.pending.clear();
         self.notes.clear();

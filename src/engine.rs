@@ -1,4 +1,5 @@
 use crate::model::*;
+use serde_json::json;
 use std::collections::HashMap;
 
 #[derive(Clone, Debug)]
@@ -116,6 +117,16 @@ impl<B: WindowBackend> Engine<B> {
             },
         );
         self.backend.watch(window.id, true);
+        crate::event_log::emit(
+            "attached",
+            json!({
+                "tab": id,
+                "window": window.id,
+                "pid": window.pid,
+                "bundle": window.identity.bundle,
+                "identifier": window.identity.identifier,
+            }),
+        );
         Ok(id)
     }
     /// Save the current live apps in tab order, once per bundle. Preferences do
@@ -157,6 +168,16 @@ impl<B: WindowBackend> Engine<B> {
             return Err(BackendError::cancelled());
         }
         let id = self.attach(None, window)?;
+        crate::event_log::emit(
+            "startup_attached",
+            json!({
+                "tab": id,
+                "window": window.id,
+                "pid": window.pid,
+                "bundle": window.identity.bundle,
+                "identifier": window.identity.identifier,
+            }),
+        );
         self.live.get_mut(&id).unwrap().deferred_startup = true;
         if self.selected.is_none() {
             self.switch_current(id, current)?;
@@ -171,7 +192,7 @@ impl<B: WindowBackend> Engine<B> {
             return Ok(());
         }
         if !self.backend.trusted() {
-            self.paused = Some("Accessibility permission is unavailable".into());
+            self.set_paused(Some("Accessibility permission is unavailable".into()));
             return Err(BackendError::new(
                 ErrorKind::Permission,
                 "Enable Accessibility, then Resume.",
@@ -192,7 +213,7 @@ impl<B: WindowBackend> Engine<B> {
             self.live.get_mut(&id).unwrap().issue = Some(DockIssue::Minimized);
         }
         if before.fullscreen || before.modal {
-            self.paused = Some("Fullscreen or dialog is active".into());
+            self.set_paused(Some("Fullscreen or dialog is active".into()));
             return Err("Close the dialog or leave fullscreen, then Resume.".into());
         }
         // Validate the previous window before changing focus or geometry.
@@ -203,7 +224,7 @@ impl<B: WindowBackend> Engine<B> {
         {
             let state = self.backend.state(old.window)?;
             if state.modal || state.fullscreen {
-                self.paused = Some("Previous window has a dialog or is fullscreen".into());
+                self.set_paused(Some("Previous window has a dialog or is fullscreen".into()));
                 return Err("Close the dialog or leave fullscreen, then Resume.".into());
             }
         }
@@ -292,7 +313,7 @@ impl<B: WindowBackend> Engine<B> {
         {
             let state = self.backend.state(a.window)?;
             if state.fullscreen || state.modal {
-                self.paused = Some("Fullscreen or dialog is active".into());
+                self.set_paused(Some("Fullscreen or dialog is active".into()));
                 return Ok(());
             }
             if state.minimized {
@@ -309,6 +330,22 @@ impl<B: WindowBackend> Engine<B> {
     }
     /// Detaching is unconditional. Failed restoration must never re-dock a released window.
     pub fn detach(&mut self, id: TabId) {
+        let bundle = self
+            .workspace
+            .tabs
+            .iter()
+            .find(|tab| tab.id == id)
+            .map(|tab| tab.identity.bundle.clone());
+        let live = self.live.get(&id);
+        crate::event_log::emit(
+            "released",
+            json!({
+                "tab": id,
+                "bundle": bundle,
+                "window": live.map(|attachment| attachment.window),
+                "deferred_startup": live.map(|attachment| attachment.deferred_startup),
+            }),
+        );
         if let Some(a) = self.live.remove(&id) {
             if a.deferred_startup {
                 self.backend.watch(a.window, false);
@@ -439,9 +476,11 @@ impl<B: WindowBackend> Engine<B> {
         for event in self.backend.events() {
             match event {
                 BackendEvent::PermissionLost => {
-                    self.paused = Some("Accessibility permission was revoked".into())
+                    crate::event_log::emit("permission_lost", json!({}));
+                    self.set_paused(Some("Accessibility permission was revoked".into()));
                 }
-                BackendEvent::Closed(w) => {
+                BackendEvent::Closed(info) => {
+                    let w = info.window;
                     self.released.retain(|_, a| a.window != w);
                     self.backend.watch(w, false);
                     let ids: Vec<_> = self
@@ -450,7 +489,17 @@ impl<B: WindowBackend> Engine<B> {
                         .filter(|(_, a)| a.window == w)
                         .map(|(id, _)| *id)
                         .collect();
+                    if ids.is_empty() {
+                        crate::event_log::window_closed(&info, None, None);
+                    }
                     for id in ids {
+                        let bundle = self
+                            .workspace
+                            .tabs
+                            .iter()
+                            .find(|tab| tab.id == id)
+                            .map(|tab| tab.identity.bundle.clone());
+                        crate::event_log::window_closed(&info, Some(id), bundle.as_deref());
                         self.live.remove(&id);
                         self.workspace.tabs.retain(|t| t.id != id);
                         self.backend.watch(w, false);
@@ -466,7 +515,9 @@ impl<B: WindowBackend> Engine<B> {
                         let expected = a.expected;
                         match self.backend.state(w) {
                             Ok(state) if state.fullscreen || state.modal => {
-                                self.paused = Some("Target entered fullscreen/dialog state".into());
+                                self.set_paused(Some(
+                                    "Target entered fullscreen/dialog state".into(),
+                                ));
                             }
                             Ok(state) if state.minimized => {
                                 self.live.get_mut(&id).unwrap().issue = Some(DockIssue::Minimized);
@@ -490,7 +541,7 @@ impl<B: WindowBackend> Engine<B> {
                                         }
                                         Err(e) if e.kind == ErrorKind::Cancelled => {}
                                         Err(e) if e.kind == ErrorKind::Permission => {
-                                            self.paused = Some(e.to_string());
+                                            self.set_paused(Some(e.to_string()));
                                         }
                                         Err(e) => a.issue = Some(DockIssue::Restore(e.to_string())),
                                     }
@@ -508,14 +559,16 @@ impl<B: WindowBackend> Engine<B> {
                                     Ok(frame) => {
                                         self.live.get_mut(&id).unwrap().expected.frame = frame
                                     }
-                                    Err(e) => self.paused = Some(e.to_string()),
+                                    Err(e) => self.set_paused(Some(e.to_string())),
                                 }
                             }
                             Err(e) if a.issue.is_some() && e.kind != ErrorKind::Permission => {
                                 self.live.get_mut(&id).unwrap().issue =
                                     Some(DockIssue::Restore(e.to_string()));
                             }
-                            Err(e) if !self.pointer_down => self.paused = Some(e.to_string()),
+                            Err(e) if !self.pointer_down => {
+                                self.set_paused(Some(e.to_string()));
+                            }
                             _ => {}
                         }
                     }
@@ -532,7 +585,7 @@ impl<B: WindowBackend> Engine<B> {
     fn resume_with_focus(&mut self, focus: bool) -> Result<()> {
         // Remain paused even after a partial failure; successful changes update
         // expected state immediately, while original restoration snapshots survive.
-        self.paused = Some("Resuming docking".into());
+        self.set_paused(Some("Resuming docking".into()));
         let result = (|| {
             if !self.backend.trusted() {
                 return Err(BackendError::new(
@@ -584,14 +637,21 @@ impl<B: WindowBackend> Engine<B> {
         })();
         match result {
             Ok(()) => {
-                self.paused = None;
+                self.set_paused(None);
                 Ok(())
             }
             Err(e) => {
-                self.paused = Some(e.to_string());
+                self.set_paused(Some(e.to_string()));
                 Err(e)
             }
         }
+    }
+    pub fn pause_for(&mut self, reason: impl Into<String>) {
+        self.set_paused(Some(reason.into()));
+    }
+    fn set_paused(&mut self, next: Option<String>) {
+        crate::event_log::pause_transition(self.paused.as_deref(), next.as_deref());
+        self.paused = next;
     }
 }
 
@@ -883,7 +943,10 @@ pub(crate) mod tests {
     fn confirmed_closed_target_removes_its_tab() {
         let mut e = fixture();
         e.switch(1).unwrap();
-        e.backend.events.push(BackendEvent::Closed(1));
+        e.backend.events.push(BackendEvent::Closed(ClosedInfo {
+            window: 1,
+            ..ClosedInfo::default()
+        }));
         e.observe();
         assert!(!e.live.contains_key(&1));
         assert_eq!(
@@ -1117,7 +1180,10 @@ pub(crate) mod tests {
         e.switch(1).unwrap();
         e.backend.fail_resize = true;
         assert!(e.release(1).is_err());
-        e.backend.events.push(BackendEvent::Closed(1));
+        e.backend.events.push(BackendEvent::Closed(ClosedInfo {
+            window: 1,
+            ..ClosedInfo::default()
+        }));
         e.observe();
         assert!(e.released.is_empty());
         e.backend.fail_resize = false;

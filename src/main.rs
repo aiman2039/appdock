@@ -6,6 +6,7 @@ mod backdrop;
 mod diagnostic;
 mod engine;
 mod error;
+mod event_log;
 #[cfg(target_os = "macos")]
 mod macos;
 mod model;

@@ -655,7 +655,13 @@ impl WindowBackend for MacBackend {
         }
     }
     fn check_window(&mut self, id: WindowId) -> Result<()> {
-        self.refresh_window(id, &mut HashMap::new())
+        match self.refresh_window(id, &mut HashMap::new())? {
+            Refresh::Present => Ok(()),
+            Refresh::Closed(_) => Err(BackendError::new(
+                ErrorKind::Closed,
+                "Window closure confirmed",
+            )),
+        }
     }
     fn events(&mut self) -> Vec<BackendEvent> {
         if !self.trusted() {
@@ -668,7 +674,7 @@ impl WindowBackend for MacBackend {
             .collect::<Vec<_>>()
             .into_iter()
             .map(|id| match self.refresh_window(id, &mut app_windows) {
-                Err(e) if e.kind == ErrorKind::Closed => BackendEvent::Closed(id),
+                Ok(Refresh::Closed(info)) => BackendEvent::Closed(info),
                 Err(e) if e.kind == ErrorKind::Permission => BackendEvent::PermissionLost,
                 _ => BackendEvent::Changed(id),
             })
@@ -676,70 +682,118 @@ impl WindowBackend for MacBackend {
     }
 }
 
+enum Refresh {
+    Present,
+    Closed(ClosedInfo),
+}
+
+fn process_missing(pid: i32) -> bool {
+    unsafe extern "C" {
+        fn kill(pid: i32, signal: i32) -> i32;
+        fn __error() -> *mut i32;
+    }
+    const ESRCH: i32 = 3; // Darwin: no such process. Other probe failures retain recovery.
+    unsafe { kill(pid, 0) == -1 && *__error() == ESRCH }
+}
+
 impl MacBackend {
+    fn confirm_closed(&mut self, info: ClosedInfo) -> Refresh {
+        if let Some(entry) = self.entries.get_mut(&info.window) {
+            entry.closed = true;
+        }
+        Refresh::Closed(info)
+    }
     fn refresh_window(
         &mut self,
         id: WindowId,
         app_windows: &mut HashMap<i32, Result<Vec<CFRetained<AXUIElement>>>>,
-    ) -> Result<()> {
-        let e = self.entry(id)?;
+    ) -> Result<Refresh> {
+        let (pid, bundle, identifier, app, element) = {
+            let e = self.entry(id)?;
+            (
+                e.info.pid,
+                e.info.identity.bundle.clone(),
+                e.info.identity.identifier.clone(),
+                e.app.clone(),
+                e.element.clone(),
+            )
+        };
         // App-list snapshots may lag. Only the OS process probe or successful
         // combined AX window-list membership can confirm closure.
-        unsafe extern "C" {
-            fn kill(pid: i32, signal: i32) -> i32;
-            fn __error() -> *mut i32;
+        if process_missing(pid) {
+            return Ok(self.confirm_closed(ClosedInfo {
+                window: id,
+                pid,
+                bundle,
+                process_exited: true,
+                ax_window_count: None,
+                exact: false,
+                identifier,
+                owners: 0,
+                reason: "process_exited".into(),
+            }));
         }
-        const ESRCH: i32 = 3; // Darwin: no such process. Other probe failures retain recovery.
-        let exited = unsafe { kill(e.info.pid, 0) == -1 && *__error() == ESRCH };
-        let membership = if exited {
-            crate::native_ops::Membership::Closed
-        } else {
-            if !self.trusted() {
-                return Err(BackendError::new(
-                    ErrorKind::Permission,
-                    "Accessibility unavailable",
-                ));
-            }
+        if !self.trusted() {
+            return Err(BackendError::new(
+                ErrorKind::Permission,
+                "Accessibility unavailable",
+            ));
+        }
+        let owners = self
+            .watched
+            .iter()
+            .filter_map(|watched| self.entries.get(watched))
+            .filter(|other| other.info.pid == pid && other.info.identity.identifier == identifier)
+            .count();
+        let (membership, exact, ax_window_count) = {
             let windows = app_windows
-                .entry(e.info.pid)
-                .or_insert_with(|| AX.windows(&e.app))
+                .entry(pid)
+                .or_insert_with(|| AX.windows(&app))
                 .as_ref()
                 .map_err(Clone::clone)?;
-            let exact = windows.iter().position(|w| **w == *e.element);
-            let owners = self
-                .watched
-                .iter()
-                .filter_map(|id| self.entries.get(id))
-                .filter(|other| {
-                    other.info.pid == e.info.pid
-                        && other.info.identity.identifier == e.info.identity.identifier
-                })
-                .count();
-            crate::native_ops::membership(
+            let exact = windows.iter().position(|w| **w == *element);
+            let membership = crate::native_ops::membership(
                 exact,
-                e.info.identity.identifier.as_deref(),
+                identifier.as_deref(),
                 owners,
                 windows.iter().map(|w| AX.string(w, "AXIdentifier")),
-            )?
+            )?;
+            (membership, exact, windows.len())
         };
         match membership {
             crate::native_ops::Membership::Closed => {
-                // A preflight caller may not remove its attachment immediately.
-                // Preserve confirmed closure until the engine acknowledges it.
-                self.entries.get_mut(&id).unwrap().closed = true;
-                Err(BackendError::new(
-                    ErrorKind::Closed,
-                    "Window closure confirmed",
-                ))
+                let reason = if identifier.is_none() {
+                    "identifier_absent"
+                } else {
+                    "identifier_unmatched"
+                };
+                Ok(self.confirm_closed(ClosedInfo {
+                    window: id,
+                    pid,
+                    bundle,
+                    process_exited: false,
+                    ax_window_count: Some(ax_window_count),
+                    exact: exact.is_some(),
+                    identifier,
+                    owners,
+                    reason: reason.into(),
+                }))
             }
             crate::native_ops::Membership::Present(index) => {
-                let element = app_windows[&e.info.pid].as_ref().unwrap()[index].clone();
-                let entry = self.entries.get_mut(&id).unwrap();
-                if entry.element != element {
+                let _ = (bundle, identifier);
+                let replacement = app_windows
+                    .get(&pid)
+                    .and_then(|result| result.as_ref().ok())
+                    .and_then(|list| list.get(index).cloned())
+                    .ok_or_else(|| {
+                        BackendError::new(ErrorKind::Communication, "Membership index missing")
+                    })?;
+                let entry = self.entries.get_mut(&id).ok_or("Window is disconnected")?;
+                if entry.element != replacement {
                     entry.number = None;
                 }
-                entry.element = element;
-                Ok(())
+                entry.element = replacement;
+                Ok(Refresh::Present)
             }
         }
     }
