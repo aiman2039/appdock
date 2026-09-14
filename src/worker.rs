@@ -202,8 +202,13 @@ pub struct Client {
     pointer_down: Arc<AtomicBool>,
     focus_suspended: Arc<AtomicBool>,
     requested_tab: Arc<Mutex<Option<(TabId, u64)>>>,
+    recovery_window: Arc<AtomicU64>,
 }
 impl Client {
+    pub fn set_recovery_window(&self, number: Option<u32>) {
+        self.recovery_window
+            .store(number.unwrap_or(0) as u64, Ordering::SeqCst);
+    }
     pub fn set_text_editing(&self, editing: bool) -> u64 {
         self.focus_suspended.store(editing, Ordering::SeqCst);
         let epoch = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
@@ -262,6 +267,28 @@ impl Client {
             .is_some_and(|(tab, _)| tab == id)
     }
 }
+// Never move windows belonging to another desktop during automatic recovery.
+fn recovery_windows_visible(engine: &Engine<MacBackend>, workspace: u32) -> bool {
+    if workspace == 0 {
+        return false;
+    }
+    let Some(stack) = crate::window_tracking::stack() else {
+        return false;
+    };
+    if !stack.iter().any(|w| w.number == workspace) {
+        return false;
+    }
+    engine.live.values().filter(|a| a.docked).all(|a| {
+        engine.backend.state(a.window).is_ok_and(|state| {
+            state.minimized
+                || engine
+                    .backend
+                    .window_number(a.window)
+                    .is_some_and(|number| stack.iter().any(|w| w.number == number))
+        })
+    })
+}
+
 fn client(workspace: Workspace) -> Client {
     let snapshot = Snapshot {
         workspace: workspace.clone(),
@@ -300,6 +327,7 @@ fn client(workspace: Workspace) -> Client {
         pointer_down: Arc::new(AtomicBool::new(false)),
         focus_suspended: Arc::new(AtomicBool::new(false)),
         requested_tab: Arc::new(Mutex::new(None)),
+        recovery_window: Arc::new(AtomicU64::new(0)),
     }
 }
 pub fn start(workspace: Workspace) -> Client {
@@ -316,6 +344,7 @@ pub fn start(workspace: Workspace) -> Client {
         let mut quitting = false;
         let mut close_attempt = 0;
         let mut next_observe = Instant::now();
+        let mut next_recovery = Instant::now() + Duration::from_secs(2);
         let mut save_after: Option<Instant> = None;
         let mut geometry_revision = 0;
         let mut startup = crate::startup::Startup::new(engine.workspace.startup_apps.clone());
@@ -383,6 +412,7 @@ pub fn start(workspace: Workspace) -> Client {
                 save_after = Some(Instant::now() + Duration::from_millis(250));
             }
             let mut stopped = false;
+            let desktop_changed = matches!(command, Some(Command::Pause));
             let result: Result<()> = match command {
                 Some(
                     Command::Attach(..)
@@ -718,6 +748,27 @@ pub fn start(workspace: Workspace) -> Client {
                 }
                 dirty = true;
             }
+            if engine.paused.is_none() || desktop_changed {
+                next_recovery = Instant::now() + Duration::from_secs(2);
+            } else if Instant::now() >= next_recovery {
+                next_recovery = Instant::now() + Duration::from_secs(2);
+                if !stopped
+                    && !quitting
+                    && !c.mailbox.priority_pending()
+                    && !c.pointer_down.load(Ordering::Relaxed)
+                    && !c.focus_suspended.load(Ordering::SeqCst)
+                    && engine.backend.trusted()
+                    && recovery_windows_visible(
+                        &engine,
+                        c.recovery_window.load(Ordering::SeqCst) as u32,
+                    )
+                {
+                    match engine.resume_in_background() {
+                        Ok(()) => status = "Ready".into(),
+                        Err(error) => status = error.to_string(),
+                    }
+                }
+            }
             if dirty || save_after.is_some_and(|t| Instant::now() >= t) {
                 save_after = None;
                 if let Err(e) = persistence::save(&persistence::path(), &engine.workspace) {
@@ -768,7 +819,7 @@ pub fn start(workspace: Workspace) -> Client {
                     engine
                         .paused
                         .as_ref()
-                        .map(|p| format!("Paused: {p}. Select Resume."))
+                        .map(|p| format!("Waiting to resume automatically: {p}"))
                         .unwrap_or_else(|| status.clone())
                 },
                 trusted: engine.backend.trusted(),

@@ -261,7 +261,6 @@ struct Ui {
     restore_button: Retained<NSButton>,
     status: Retained<NSTextField>,
     permission_button: Retained<NSButton>,
-    resume_button: Retained<NSButton>,
     replace_button: Retained<NSButton>,
     rename_editor: Option<RenameEditor>,
     picker: crate::picker::InlinePicker,
@@ -418,7 +417,6 @@ define_class!(
         #[unsafe(method(renameTabButton:))] fn rename_button(&self,sender:&NSButton){self.begin_rename(sender.tag() as u64);}
         #[unsafe(method(releaseTab:))] fn release(&self,_:&AnyObject){self.release_current();}
         #[unsafe(method(releaseThisTab:))] fn release_this(&self,sender:&NSButton){if let Some(u)=self.ivars().ui.borrow().as_ref(){u.client.send(Command::Release(sender.tag() as u64));}}
-        #[unsafe(method(resumeDocking:))] fn resume(&self,_:&AnyObject){if let Some(u)=self.ivars().ui.borrow().as_ref(){u.client.send(Command::Resume);u.client.send(Command::Discover);}}
         #[unsafe(method(restoreWindow:))] fn restore_window(&self,_:&AnyObject){
             self.finish_rename(true);
             if let Some(u)=self.ivars().ui.borrow().as_ref(){
@@ -666,17 +664,12 @@ impl Delegate {
             sel!(permission:),
             rect(w - 196., h - 62., 188., 26.),
         );
-        let resume_button = self.button(
-            "Resume",
-            sel!(resumeDocking:),
-            rect(w - 90., h - 62., 82., 26.),
-        );
         let replace_button = self.button(
             "Replace window…",
             sel!(replaceWindow:),
             rect(w - 242., h - 62., 144., 26.),
         );
-        for button in [&permission_button, &resume_button, &replace_button] {
+        for button in [&permission_button, &replace_button] {
             button.setHidden(true);
             button.setAutoresizingMask(
                 NSAutoresizingMaskOptions::ViewMinXMargin
@@ -785,7 +778,6 @@ impl Delegate {
             restore_button,
             status,
             permission_button,
-            resume_button,
             replace_button,
             refresh_started: std::time::Instant::now(),
             refresh: crate::schedule::RefreshSchedule::default(),
@@ -1416,6 +1408,18 @@ impl Delegate {
         }
         u.client
             .set_pointer_down(NSEvent::pressedMouseButtons() != 0);
+        let can_recover = !self.ivars().window_closed.get()
+            && u.window.isVisible()
+            && !u.window.isMiniaturized()
+            && !NSApplication::sharedApplication(self.mtm()).isHidden()
+            && !u.picker_open
+            && !u.pending_picker
+            && !u.pending_settings
+            && u.rename_editor.is_none()
+            && u.pending_rename.is_none()
+            && !u.setup_wizard.as_ref().is_some_and(|setup| setup.visible());
+        u.client
+            .set_recovery_window(can_recover.then(|| u.window.windowNumber() as u32));
         let mut s = u.client.snapshot.lock().unwrap().clone();
         if std::env::args().any(|a| a == "--tabs-smoke") && !(8..24).contains(&count) {
             // Exercise the real rendering path as the visible list grows/shrinks.
@@ -1680,8 +1684,6 @@ impl Delegate {
             return;
         }
         u.permission_button.setHidden(setup_visible || s.trusted);
-        u.resume_button
-            .setHidden(setup_visible || !s.trusted || !s.paused);
         let disconnected = u
             .editing
             .is_some_and(|id| !s.live.iter().any(|(t, _)| *t == id));
@@ -2319,6 +2321,7 @@ impl Delegate {
                 u.pending_settings = false;
                 u.editing_focus_pending = None;
                 u.client.set_text_editing(false);
+                u.client.set_recovery_window(None);
                 (u.window.clone(), u.backdrop.clone())
             })
         };

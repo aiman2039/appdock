@@ -41,7 +41,7 @@ impl<B: WindowBackend> Engine<B> {
         if !self.backend.trusted() {
             return Err(BackendError::new(
                 ErrorKind::Permission,
-                "Enable Accessibility in System Settings, then Resume.",
+                "Enable Accessibility in System Settings.",
             ));
         }
         if !window.eligible {
@@ -178,7 +178,9 @@ impl<B: WindowBackend> Engine<B> {
             ));
         }
         if let Some(reason) = &self.paused {
-            return Err(format!("Docking paused: {reason}. Select Resume.").into());
+            return Err(
+                format!("Docking paused: {reason}. Waiting for automatic recovery.").into(),
+            );
         }
         let next = self
             .live
@@ -522,6 +524,12 @@ impl<B: WindowBackend> Engine<B> {
         }
     }
     pub fn resume(&mut self) -> Result<()> {
+        self.resume_with_focus(true)
+    }
+    pub fn resume_in_background(&mut self) -> Result<()> {
+        self.resume_with_focus(false)
+    }
+    fn resume_with_focus(&mut self, focus: bool) -> Result<()> {
         // Remain paused even after a partial failure; successful changes update
         // expected state immediately, while original restoration snapshots survive.
         self.paused = Some("Resuming docking".into());
@@ -564,10 +572,11 @@ impl<B: WindowBackend> Engine<B> {
                 a.expected.modal = false;
                 a.issue = None;
             }
-            if let Some(a) = self
-                .selected
-                .and_then(|id| self.live.get(&id))
-                .filter(|a| a.docked && a.issue.is_none())
+            if focus
+                && let Some(a) = self
+                    .selected
+                    .and_then(|id| self.live.get(&id))
+                    .filter(|a| a.docked && a.issue.is_none())
             {
                 self.backend.focus(a.window)?;
             }
@@ -1307,6 +1316,31 @@ pub(crate) mod tests {
         e.backend.fail_restored_validation = false;
         e.switch(1).unwrap();
         assert!(e.live[&1].issue.is_none());
+    }
+    #[test]
+    fn background_recovery_waits_for_dialog_and_permission_without_taking_focus() {
+        let mut e = fixture();
+        e.switch(1).unwrap();
+        e.switch(2).unwrap();
+        e.paused = Some("Desktop changed".into());
+        e.backend.focused = None;
+        e.backend.permission_lost = true;
+        let moves = e.backend.moves;
+        assert!(e.resume_in_background().is_err());
+        assert_eq!(e.backend.moves, moves);
+        e.backend.permission_lost = false;
+        e.backend.states.get_mut(&1).unwrap().modal = true;
+        assert!(e.resume_in_background().is_err());
+        assert_eq!(e.backend.moves, moves);
+        e.backend.states.get_mut(&1).unwrap().modal = false;
+        e.area.x += 100.;
+        e.backend.states.get_mut(&1).unwrap().minimized = true;
+        let minimized = e.backend.states[&1];
+        e.resume_in_background().unwrap();
+        assert!(e.paused.is_none());
+        assert_eq!(e.backend.states[&1], minimized);
+        assert_eq!(e.backend.states[&2].frame, e.area);
+        assert_eq!(e.backend.focused, None);
     }
     #[test]
     fn resume_preserves_minimized_tabs_until_explicit_selection() {

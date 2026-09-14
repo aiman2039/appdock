@@ -392,7 +392,7 @@ impl MacBackend {
         if !self.trusted() {
             return Err(BackendError::new(
                 ErrorKind::Permission,
-                "Grant AppDock Accessibility permission in System Settings, then Resume",
+                "Grant AppDock Accessibility permission in System Settings",
             ));
         }
         let ax = Ax {
