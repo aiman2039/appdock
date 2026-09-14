@@ -10,6 +10,7 @@ mod error;
 mod macos;
 mod model;
 mod native_ops;
+mod onboarding;
 mod persistence;
 #[cfg(target_os = "macos")]
 mod picker;
@@ -71,6 +72,10 @@ fn main() {
             arg.as_deref(),
             Some("--diagnose" | "--smoke" | "--diagnose-badges" | "--diagnose-windows")
         ) {
+            if let Err(e) = diagnostic::prepare_launch(arg.as_deref().unwrap()) {
+                eprintln!("{e}");
+                std::process::exit(2);
+            }
             let result = if arg.as_deref() == Some("--diagnose-windows") {
                 diagnostic::windows()
             } else if arg.as_deref() == Some("--diagnose-badges") {

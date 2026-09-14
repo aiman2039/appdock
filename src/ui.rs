@@ -1,5 +1,6 @@
 //! AppKit stays on the main thread. The worker exchanges only owned Rust data.
 pub(crate) mod fixtures;
+mod setup;
 use crate::{
     appearance as theme,
     macos::App,
@@ -232,6 +233,8 @@ struct Ivars {
 }
 struct Ui {
     fixture: fixtures::FixtureState,
+    setup_wizard: Option<setup::SetupUi>,
+    setup_auto_shown: bool,
     client: Client,
     refresh_started: std::time::Instant,
     refresh: crate::schedule::RefreshSchedule,
@@ -340,6 +343,11 @@ define_class!(
         #[unsafe(method(trackDrag:))] fn drag_timer(&self,_:&NSTimer){self.track_drag();}
         #[unsafe(method(tick:))] fn timer(&self,_:&NSTimer){self.tick();}
         #[unsafe(method(selectTab:))] fn select_tab(&self,sender:&NSButton){self.dismiss_picker(false);self.finish_rename(true);let mut b=self.ivars().ui.borrow_mut();if let Some(u)=b.as_mut(){let id=sender.tag() as u64;u.editing=Some(id);u.client.switch(id);}}
+        #[unsafe(method(showSetup:))] fn show_setup_action(&self,_:&AnyObject){self.show_setup();}
+        #[unsafe(method(setupNext:))] fn next_setup_action(&self,_:&AnyObject){self.setup_next();}
+        #[unsafe(method(setupBack:))] fn back_setup_action(&self,_:&AnyObject){self.setup_back();}
+        #[unsafe(method(setupAction:))] fn setup_secondary_action(&self,_:&AnyObject){self.setup_action();}
+        #[unsafe(method(setupLater:))] fn later_setup_action(&self,_:&AnyObject){self.hide_setup();}
         #[unsafe(method(addWindow:))] fn add(&self,_:&AnyObject){self.show_picker(false);}
         #[unsafe(method(replaceWindow:))] fn replace(&self,_:&AnyObject){self.show_picker(true);}
         #[unsafe(method(refreshWindows:))] fn refresh(&self,_:&AnyObject){if let Some(u)=self.ivars().ui.borrow().as_ref(){u.client.send(Command::Discover);}}
@@ -355,7 +363,7 @@ define_class!(
         #[unsafe(method(releaseTab:))] fn release(&self,_:&AnyObject){self.release_current();}
         #[unsafe(method(releaseThisTab:))] fn release_this(&self,sender:&NSButton){if let Some(u)=self.ivars().ui.borrow().as_ref(){u.client.send(Command::Release(sender.tag() as u64));}}
         #[unsafe(method(resumeDocking:))] fn resume(&self,_:&AnyObject){if let Some(u)=self.ivars().ui.borrow().as_ref(){u.client.send(Command::Resume);u.client.send(Command::Discover);}}
-        #[unsafe(method(permission:))] fn permission(&self,_:&AnyObject){if let Some(u)=self.ivars().ui.borrow().as_ref(){u.client.send(Command::RequestPermission);}let url=objc2_foundation::NSURL::URLWithString(&NSString::from_str("x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")).unwrap();NSWorkspace::sharedWorkspace().openURL(&url);}
+        #[unsafe(method(permission:))] fn permission(&self,_:&AnyObject){self.show_setup();}
         #[unsafe(method(spaceChanged:))] fn space(&self,_:&NSNotification){if let Some(u)=self.ivars().ui.borrow().as_ref(){u.client.send(Command::Pause);}}
         #[unsafe(method(dragTab:))] fn drag(&self,sender:&NSPanGestureRecognizer){if sender.state()==NSGestureRecognizerState::Ended && let Some(view)=sender.view(){let b=self.ivars().ui.borrow();if let Some(u)=b.as_ref(){let id=view.tag() as u64;let point=sender.locationInView(Some(&u.tabs));let index=(point.x/TAB_WIDTH).max(0.) as usize;u.client.send(Command::Reorder(id,index));}}}
         #[unsafe(method(closeSettingsFixture:))] fn close_settings_fixture(&self,_:&NSTimer){self.finish_settings_fixture();}
@@ -413,6 +421,10 @@ impl Delegate {
                 return;
             }
         };
+        let is_fixture = std::env::args().any(|arg| arg.ends_with("-smoke"));
+        if is_fixture {
+            workspace.onboarding_completed = true;
+        }
         let fixture_child = if std::env::args()
             .any(|a| matches!(a.as_str(), "--frame-smoke" | "--pointer-smoke"))
         {
@@ -657,6 +669,8 @@ impl Delegate {
         let _ = self.ivars().backdrop.set(backdrop.clone());
         *self.ivars().ui.borrow_mut() = Some(Ui {
             client,
+            setup_wizard: None,
+            setup_auto_shown: is_fixture,
             window: window.clone(),
             backdrop,
             tabs,
@@ -774,6 +788,18 @@ impl Delegate {
         unsafe {
             settings_item.setTarget(Some(self));
         }
+        let setup_item = unsafe {
+            NSMenuItem::initWithTitle_action_keyEquivalent(
+                NSMenuItem::alloc(m),
+                &NSString::from_str("Setup & Diagnostics…"),
+                Some(sel!(showSetup:)),
+                &NSString::from_str(""),
+            )
+        };
+        unsafe {
+            setup_item.setTarget(Some(self));
+        }
+        submenu.addItem(&setup_item);
         submenu.addItem(&settings_item);
         submenu.addItem(&startup_item);
         submenu.addItem(&NSMenuItem::separatorItem(m));
@@ -822,6 +848,7 @@ impl Delegate {
         }
     }
     fn show_settings(&self) {
+        self.hide_setup();
         self.dismiss_picker(false);
         self.finish_rename(true);
         let mut b = self.ivars().ui.borrow_mut();
@@ -1068,6 +1095,14 @@ impl Delegate {
             bounds.size.width - 2. * FRAME,
             (bounds.size.height - u.surface.chrome() - 2. * FRAME).max(100.),
         ));
+        if let Some(setup) = &u.setup_wizard {
+            setup.layout(rect(
+                FRAME,
+                FRAME,
+                bounds.size.width - 2. * FRAME,
+                (bounds.size.height - u.surface.chrome() - 2. * FRAME).max(100.),
+            ));
+        }
         let body = u.window.convertRectToScreen(rect(
             FRAME,
             FRAME,
@@ -1090,6 +1125,16 @@ impl Delegate {
         }
     }
     fn tick(&self) {
+        let show_setup = self.ivars().ui.borrow().as_ref().is_some_and(|u| {
+            !u.setup_auto_shown && self.ivars().ticks.get() > 1 && {
+                let s = u.client.snapshot.lock().unwrap();
+                !s.workspace.onboarding_completed || !s.trusted
+            }
+        });
+        if show_setup {
+            self.show_setup();
+        }
+        self.refresh_setup();
         let count = self.ivars().ticks.get();
         self.ivars().ticks.set(count + 1);
         let mut b = self.ivars().ui.borrow_mut();
@@ -1194,6 +1239,7 @@ impl Delegate {
             && !u.picker_open
             && !u.pending_picker
             && !u.pending_settings
+            && !u.setup_wizard.as_ref().is_some_and(|setup| setup.visible())
             && !u.window.inLiveResize()
             && NSEvent::pressedMouseButtons() == 0
             && !self.ivars().dragging.get()
@@ -1227,6 +1273,7 @@ impl Delegate {
         if !s.paused
             && !s.quitting
             && !s.stopped
+            && !u.setup_wizard.as_ref().is_some_and(|setup| setup.visible())
             && u.window.isVisible()
             && !u.window.isMiniaturized()
             && !NSApplication::sharedApplication(self.mtm()).isHidden()
@@ -1253,8 +1300,10 @@ impl Delegate {
         if u.window.hasShadow() == attached {
             u.window.setHasShadow(!attached);
         }
-        u.surface.set_attached(attached && !u.picker_open);
-        u.hint.setHidden(attached || u.picker_open);
+        let setup_visible = u.setup_wizard.as_ref().is_some_and(|setup| setup.visible());
+        u.surface
+            .set_attached(attached && !u.picker_open && !setup_visible);
+        u.hint.setHidden(attached || u.picker_open || setup_visible);
         if self.ivars().raise_requested.replace(false) {
             u.raise_after = Some(std::time::Instant::now() - std::time::Duration::from_millis(251));
         }
@@ -1268,6 +1317,7 @@ impl Delegate {
             && !u.picker_open
             && !u.pending_picker
             && !u.pending_settings
+            && !u.setup_wizard.as_ref().is_some_and(|setup| setup.visible())
             && u.rename_editor.is_none()
             && u.pending_rename.is_none()
         {
@@ -1300,13 +1350,17 @@ impl Delegate {
             NSApplication::sharedApplication(self.mtm()).terminate(None);
             return;
         }
-        u.permission_button.setHidden(s.trusted);
-        u.resume_button.setHidden(!s.trusted || !s.paused);
+        u.permission_button.setHidden(setup_visible || s.trusted);
+        u.resume_button
+            .setHidden(setup_visible || !s.trusted || !s.paused);
         let disconnected = u
             .editing
             .is_some_and(|id| !s.live.iter().any(|(t, _)| *t == id));
-        u.replace_button.setHidden(!s.trusted || !disconnected);
-        let text = if !s.trusted {
+        u.replace_button
+            .setHidden(setup_visible || !s.trusted || !disconnected);
+        let text = if setup_visible {
+            String::new()
+        } else if !s.trusted {
             "Allow window control to arrange your app windows.".to_string()
         } else {
             u.shortcut_error.clone().unwrap_or_else(|| {
@@ -1319,11 +1373,12 @@ impl Delegate {
         };
         u.status.setStringValue(&NSString::from_str(&text));
         u.status.setHidden(text.is_empty());
-        let chrome = if !text.is_empty() || !s.trusted || s.paused || disconnected {
-            STATUS_CHROME
-        } else {
-            CHROME
-        };
+        let chrome =
+            if !setup_visible && (!text.is_empty() || !s.trusted || s.paused || disconnected) {
+                STATUS_CHROME
+            } else {
+                CHROME
+            };
         if u.surface.set_chrome(chrome) {
             let bounds = u.surface.bounds();
             let mut frame = u.hint.frame();
@@ -1363,6 +1418,7 @@ impl Delegate {
             && !u.picker_open
             && !u.pending_picker
             && !u.pending_settings
+            && !u.setup_wizard.as_ref().is_some_and(|setup| setup.visible())
             && u.rename_editor.is_none()
             && u.pending_rename.is_none()
             && !u.window.isMiniaturized()
@@ -1464,6 +1520,7 @@ impl Delegate {
                 && !u.picker_open
                 && !u.pending_picker
                 && !u.pending_settings
+                && !u.setup_wizard.as_ref().is_some_and(|setup| setup.visible())
                 && e.state == HotKeyState::Pressed
                 && !s.workspace.tabs.is_empty()
             {
@@ -1599,6 +1656,15 @@ impl Delegate {
         u.picker.render(self.mtm(), self, windows);
     }
     fn show_picker(&self, replace: bool) {
+        if self
+            .ivars()
+            .ui
+            .borrow()
+            .as_ref()
+            .is_some_and(|u| u.setup_wizard.as_ref().is_some_and(|s| s.visible()))
+        {
+            self.hide_setup();
+        }
         self.finish_rename(true);
         let (window, search) = {
             let mut b = self.ivars().ui.borrow_mut();
@@ -1844,6 +1910,7 @@ impl Delegate {
         }
     }
     fn close_request(&self) {
+        self.hide_setup();
         if let Some(u) = self.ivars().ui.borrow_mut().as_mut() {
             if u.pending_settings {
                 u.pending_settings = false;

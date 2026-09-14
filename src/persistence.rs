@@ -69,6 +69,23 @@ pub fn save(path: &Path, workspace: &Workspace) -> Result<()> {
 mod tests {
     use super::*;
     #[test]
+    fn legacy_workspace_needs_setup_and_completion_survives_launch() {
+        let path =
+            std::env::temp_dir().join(format!("appdock-setup-legacy-{}.json", std::process::id()));
+        let mut legacy = serde_json::to_value(Workspace::default()).unwrap();
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("onboarding_completed");
+        fs::write(&path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+        let mut workspace = load_for_launch(&path).unwrap();
+        assert!(!workspace.onboarding_completed);
+        workspace.onboarding_completed = true;
+        save(&path, &workspace).unwrap();
+        assert!(load_for_launch(&path).unwrap().onboarding_completed);
+        fs::remove_file(path).unwrap();
+    }
+    #[test]
     fn unknown_version_is_not_overwritten() {
         let p = std::env::temp_dir().join(format!("appdock-version-{}.json", std::process::id()));
         fs::write(&p, b"{\"version\":999}").unwrap();

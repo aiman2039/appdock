@@ -9,11 +9,14 @@ case "${1:-}" in
   '') cargo build --release --locked ;;
   *) echo 'Usage: scripts/package.sh [--debug]' >&2; exit 2 ;;
 esac
-bundle="$PWD/dist/AppDock.app"
+output="${APPDOCK_PACKAGE_DIR:-$PWD/dist}"
+mkdir -p "$output"
+output="$(cd "$output" && pwd)"
+bundle="$output/AppDock.app"
 mkdir -p "$bundle/Contents/MacOS"
 cp "target/$profile/appdock" "$bundle/Contents/MacOS/AppDock"
 mkdir -p "$bundle/Contents/Resources"
-iconset="$PWD/dist/AppDock.iconset"
+iconset="$output/AppDock.iconset"
 mkdir -p "$iconset"
 for size in 16 32 128 256 512; do
   sips -z "$size" "$size" assets/branding/appdock.png \

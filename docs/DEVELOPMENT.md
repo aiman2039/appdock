@@ -15,21 +15,21 @@ scripts/package.sh           # release bundle, ad-hoc signed
 open dist/AppDock.app
 ```
 
-`./scripts/package.sh --debug` packages the development build. Neither form notarizes, publishes, nor installs outside this directory.
+`./scripts/package.sh --debug` packages the development build. Neither form notarizes, publishes, nor installs the app. Output defaults to `dist`; `APPDOCK_PACKAGE_DIR` can select a temporary build location.
 
 ## GitHub releases
 
-The `Release` workflow builds native macOS Apple Silicon (`arm64`) and Intel (`x86_64`) apps with Rust 1.95.0, runs deterministic tests and lint checks on both architectures, and uploads an `AppDock-vVERSION-macos-ARCH.zip` plus its SHA-256 checksum to the GitHub Release. Each ZIP contains `AppDock.app`. No Docker or additional repository secrets are required; publishing uses the repository's `GITHUB_TOKEN`.
+The `Release` workflow builds native macOS Apple Silicon (`arm64`) and Intel (`x86_64`) apps with Rust 1.95.0, runs deterministic tests and lint checks on both architectures, and uploads `AppDock-vVERSION-macos-ARCH.dmg` and `.zip` assets with SHA-256 checksums. Both contain `AppDock.app`; the DMG adds the Finder installation layout. Signing and notarization use the existing `APPLE_*` secrets, while publishing uses the repository's `GITHUB_TOKEN`. No Docker is required.
 
 Set and commit the app version in `Cargo.toml`, then use **Actions → Release → Run workflow** and select the desired branch or revision. There is **no version/tag input**. The workflow derives `vVERSION` from the checked-out manifest, creates that tag if needed, and builds both architectures from the same immutable commit. An existing tag pointing to a different commit is rejected; bump the Cargo version before releasing new code under a new tag.
 
 The release workflow is **manual-only**: pushes and release-publication events do not start it. Rust caches are reused across manual runs on the selected branch and separate architecture, toolchain, compiler environment, and dependency state. Checks on `master` and pull requests use Rust 1.95.0 on Apple Silicon and Intel, plus stable Rust on Apple Silicon. The pinned jobs share their cache configuration with releases; `master` builds also warm release-profile dependencies. Repeated runs of the same release replace its named assets while preserving release notes.
 
-The app bundles use ad-hoc signing, as local packages do; they are not Developer ID signed or notarized, so macOS may block downloaded builds pending user approval. Hosted tests do not validate Accessibility permission or live desktop interactions. macOS 12 is the declared deployment minimum; release CI runs on macOS 15 and does not prove compatibility with every older version.
+Release app bundles and disk images are Developer ID signed, notarized, and stapled. Local packages are ad-hoc signed development builds. Hosted tests do not validate Accessibility permission or live desktop interactions. macOS 12 is the declared deployment minimum; release CI runs on macOS 15 and does not prove compatibility with every older version.
 
 Linux and Windows are not implemented: the non-macOS executable only reports that macOS is required. Useful releases for those platforms require native UI and window-control backends. A macOS universal binary containing both existing architectures is another possible packaging option.
 
-If prompted, click **Allow window control…**, enable AppDock in System Settings → Privacy & Security → Accessibility, and select **Resume**. If AppDock is absent from the list, use the + button to select `dist/AppDock.app`. Permission belongs to the launch context: a successful terminal diagnostic does not prove a Finder-launched bundle is authorized. Rebuilding an ad-hoc signed app may require granting permission again.
+Use the in-app setup wizard to verify installation, grant Accessibility access, and test a docked window. Rerun it from **AppDock → Setup & Diagnostics**. If AppDock is absent from the list, use the + button to select `dist/AppDock.app`. Permission belongs to the launch context: a successful terminal diagnostic does not prove a Finder-launched bundle is authorized. Rebuilding an ad-hoc signed app may require granting permission again.
 
 ## Use
 
@@ -81,8 +81,15 @@ cargo fmt --all --check
 cargo clippy --all-targets --all-features --locked -- -D warnings
 cargo test --all-features --locked
 cargo build --locked
+```
+
+Run native diagnostics from a normal macOS desktop terminal, or have the agent request approved execution outside its sandbox:
+
+```sh
 ./target/debug/appdock --diagnose
 ```
+
+`--diagnose`, `--diagnose-badges`, `--diagnose-windows`, and `--smoke` write their mode, PID, and Unix timestamp in milliseconds to stderr before native initialization. They exit with status 2 when `CODEX_SANDBOX=seatbelt`, before calling AppKit. Do not unset that variable: it identifies a restricted launch context but does not control sandbox permissions. Other restricted environments may not expose this signal. AppKit initialization is retained because removing it has not been validated and discovery through `NSWorkspace` still needs native services. Run native UI fixtures outside the agent sandbox as well.
 
 `--diagnose` is read-only and reports Accessibility status, window counts, and geometry for Discord and Telegram Lite. `--smoke` is an explicit **live-window test**: it requires exactly one eligible window in each app, switches six cycles, moves/resizes windows, restores original state, and reads it back. Do not interact with the targets during that test. It does not type or send messages.
 
@@ -145,3 +152,21 @@ See [startup, tab, and minimized-window validation](STARTUP-AND-MINIMIZED-WINDOW
 The Settings button waits for the worker focus barrier before opening its native menu. This keeps pending app-raise requests from taking focus during configuration. Saving/resetting affects startup app choices only. AppDock disables its own shadow while an app is docked and uses the surrounding frame color behind rounded native corners; the external app retains its native border and shadow. See [settings and frame validation](SETTINGS-AND-FRAME.md).
 
 Minimized-window selection waits briefly for native controls to become ready after restoring, instead of immediately rejecting the window and minimizing it again. A single genuine restore can still use macOS's animation; AppDock does not change system-wide Dock settings. [Validation and timings](QUIET-STARTUP-AND-RESTORE.md).
+
+
+## Drag-to-Applications installer
+
+Release builds publish an architecture-specific DMG alongside each ZIP. The Finder window contains AppDock, an Applications shortcut, and installation instructions. Layout is generated by pinned `dmgbuild`, without Finder/AppleScript automation in CI. The app is signed, notarized, and stapled before packaging; the DMG is then signed, notarized, and stapled separately. Checksums cover both formats.
+
+To build a local development installer without touching an existing `dist` bundle:
+
+```sh
+python3 -m venv /tmp/appdock-dmg-tools
+/tmp/appdock-dmg-tools/bin/python -m pip install -r scripts/dmg-requirements.txt
+APPDOCK_PACKAGE_DIR=/tmp/appdock-installer scripts/package.sh --debug
+DMGBUILD=/tmp/appdock-dmg-tools/bin/dmgbuild scripts/package-dmg.sh /tmp/appdock-installer/AppDock.app /tmp/AppDock-development.dmg
+```
+
+This produces an ad-hoc-signed app inside an unsigned, unnotarized development DMG. It does not install the app or change Accessibility settings. Regenerate the Finder background with `xcrun swift scripts/dmg-background.swift assets/installer/background.png`.
+
+The onboarding view is embedded in the workspace and scrolls at smaller window sizes. Running from `/Volumes` or App Translocation holds users at the install step; they must reopen the installed app before granting access. Development binaries outside a bundle can continue for testing.

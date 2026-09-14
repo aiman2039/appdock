@@ -90,6 +90,8 @@ pub struct Workspace {
     pub startup_apps: Vec<StartupApp>,
     #[serde(default = "default_keep_apps_open")]
     pub keep_apps_open_on_close: bool,
+    #[serde(default)]
+    pub onboarding_completed: bool,
 }
 fn default_keep_apps_open() -> bool {
     true
@@ -104,6 +106,7 @@ impl Default for Workspace {
             previous_shortcut: "Control+Alt+Super+ArrowLeft".into(),
             startup_apps: vec![],
             keep_apps_open_on_close: true,
+            onboarding_completed: false,
         }
     }
 }

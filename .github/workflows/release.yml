@@ -48,7 +48,7 @@ jobs:
     name: Build macOS (${{ matrix.arch }})
     needs: prepare
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 60
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
@@ -81,9 +81,14 @@ jobs:
         run: ./scripts/check.sh
       - name: Package release app
         run: scripts/package.sh
-      - name: Sign and notarize macOS app
+      - name: Install disk image packaging tools
+        run: |
+          python3 -m venv "$RUNNER_TEMP/appdock-dmg-tools"
+          "$RUNNER_TEMP/appdock-dmg-tools/bin/python" -m pip install -r scripts/dmg-requirements.txt
+          echo "DMGBUILD=$RUNNER_TEMP/appdock-dmg-tools/bin/dmgbuild" >> "$GITHUB_ENV"
+      - name: Sign and notarize macOS app and installer
         if: runner.os == 'macOS'
-        timeout-minutes: 30
+        timeout-minutes: 50
         env:
           APPLE_CERTIFICATE_P12_BASE64: ${{ secrets.APPLE_CERTIFICATE_P12_BASE64 }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
@@ -144,6 +149,20 @@ jobs:
           xcrun stapler staple "$app"
           xcrun stapler validate "$app"
           spctl --assess --type execute --verbose=2 "$app"
+          # Staple the app before putting it in the drag-to-Applications installer.
+          # The outer disk image is also signed, notarized and stapled for offline use.
+          installer="dist/AppDock.dmg"
+          scripts/package-dmg.sh "$app" "$installer"
+          codesign --force --sign "$identity" --keychain "$keychain" --timestamp "$installer"
+          codesign --verify --strict --verbose=2 "$installer"
+          result="$RUNNER_TEMP/appdock-installer-notarization.json"
+          xcrun notarytool submit "$installer" \
+            --apple-id "$APPLE_ID" --password "$APPLE_APP_SPECIFIC_PASSWORD" \
+            --team-id "$APPLE_TEAM_ID" --wait --timeout 20m --output-format json > "$result"
+          python3 -c 'import json,sys; r=json.load(open(sys.argv[1])); print("Installer notarization:", r.get("id"), r.get("status")); sys.exit(0 if r.get("status") == "Accepted" else 1)' "$result"
+          xcrun stapler staple "$installer"
+          xcrun stapler validate "$installer"
+          spctl --assess --type open --context context:primary-signature --verbose=2 "$installer"
       - name: Remove temporary macOS signing credentials
         if: always() && runner.os == 'macOS'
         run: |
@@ -168,11 +187,17 @@ jobs:
           RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
         run: |
           lipo dist/AppDock.app/Contents/MacOS/AppDock -verify_arch "$EXPECTED_ARCH"
+          codesign --verify --deep --strict dist/AppDock.app
+          scripts/verify-dmg.sh dist/AppDock.dmg "$EXPECTED_ARCH"
+          xcrun stapler validate dist/AppDock.dmg
           mkdir -p release-assets
+          installer="AppDock-${RELEASE_TAG}-macos-${EXPECTED_ARCH}.dmg"
+          mv dist/AppDock.dmg "release-assets/$installer"
           archive="AppDock-${RELEASE_TAG}-macos-${EXPECTED_ARCH}.zip"
           ditto -c -k --sequesterRsrc --keepParent dist/AppDock.app "release-assets/$archive"
           cd release-assets
           shasum -a 256 "$archive" > "$archive.sha256"
+          shasum -a 256 "$installer" > "$installer.sha256"
       - uses: actions/upload-artifact@v7
         with:
           name: appdock-macos-${{ matrix.arch }}
@@ -201,6 +226,8 @@ jobs:
       - name: Verify downloaded archives
         working-directory: release-assets
         run: |
+          test -f "AppDock-${RELEASE_TAG}-macos-arm64.dmg"
+          test -f "AppDock-${RELEASE_TAG}-macos-x86_64.dmg"
           test -f "AppDock-${RELEASE_TAG}-macos-arm64.zip"
           test -f "AppDock-${RELEASE_TAG}-macos-x86_64.zip"
           sha256sum --check ./*.sha256

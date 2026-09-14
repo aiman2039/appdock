@@ -33,14 +33,19 @@ Keep your open app windows organized and switch between them with a click.
 
 ## Get started
 
-1. Download the ZIP for your Mac: **arm64** for Apple Silicon (M-series), or **x86_64** for Intel.
-2. Unzip it, move **AppDock.app** to Applications, and open it.
-3. Allow AppDock in **System Settings → Privacy & Security → Accessibility** so it can arrange your windows. Return to AppDock and click **Resume**.
-4. Open the apps you want to use, then click **+ Add App** to add their windows.
+1. Download the **DMG installer** for your Mac: **arm64** for Apple Silicon (M-series), or **x86_64** for Intel.
+2. Open the DMG and drag **AppDock** onto **Applications** in the installer window.
+3. Eject the installer, then open **AppDock** from Applications.
+4. Follow the setup wizard inside AppDock: verify Accessibility access, check available windows, and dock a window to test control.
+5. Confirm you can interact with the docked window, then finish setup. Use **+ Add App** for more windows.
+
+![AppDock DMG showing the app, arrow, and Applications folder](docs/screenshots/install-dmg.png)
+
+Reopen the wizard from **AppDock → Setup & Diagnostics**. If Accessibility is enabled but verification fails, quit older copies, remove the old AppDock entry from Accessibility settings, add the copy in Applications, enable it, and reopen AppDock. Screen Recording and Input Monitoring are not required for window control.
 
 In **Settings**, choose which running apps to add next time. AppDock starts with an empty workspace until you choose startup apps.
 
-Downloaded builds aren’t notarized by Apple, so macOS may ask you to approve opening the app.
+The release workflow signs and notarizes both the app and the DMG installer, and attaches Apple’s verification tickets for offline opening. ZIP downloads remain available as an alternative.
 
 ## Good to know
 

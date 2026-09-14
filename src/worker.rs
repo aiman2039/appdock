@@ -22,6 +22,9 @@ pub struct Snapshot {
     pub occupied: Vec<WindowId>,
     pub status: String,
     pub trusted: bool,
+    pub readiness: crate::onboarding::Readiness,
+    pub setup_docked: bool,
+    pub setup_completion: Option<(u64, std::result::Result<(), String>)>,
     pub paused: bool,
     pub stopped: bool,
     pub quitting: bool,
@@ -52,6 +55,8 @@ pub enum Command {
     Pause,
     Resume,
     RequestPermission,
+    VerifySetup(u64),
+    CompleteSetup(u64),
     Raise,
     Quit,
     CancelQuit,
@@ -251,6 +256,9 @@ fn client(workspace: Workspace) -> Client {
         occupied: vec![],
         status: "Add an existing window to begin.".into(),
         trusted: false,
+        readiness: Default::default(),
+        setup_docked: false,
+        setup_completion: None,
         paused: false,
         stopped: false,
         quitting: false,
@@ -290,6 +298,9 @@ pub fn start(workspace: Workspace) -> Client {
         let mut geometry_revision = 0;
         let mut startup = crate::startup::Startup::new(engine.workspace.startup_apps.clone());
         let mut discovery_complete = false;
+        let mut readiness = crate::onboarding::Readiness::default();
+        let mut setup_window = None;
+        let mut setup_completion = None;
         loop {
             let deadline = save_after.map_or(next_observe, |t| t.min(next_observe));
             let command = c
@@ -360,6 +371,50 @@ pub fn start(workspace: Workspace) -> Client {
                     engine.backend.update_apps(apps);
                     Ok(())
                 }
+                Some(Command::VerifySetup(generation)) => {
+                    setup_window = None;
+                    setup_completion = None;
+                    let deadline = Instant::now() + Duration::from_secs(8);
+                    let epoch = c.mailbox.interruption.load(Ordering::SeqCst);
+                    let result = engine.backend.discover_current(|| {
+                        Instant::now() < deadline
+                            && epoch == c.mailbox.interruption.load(Ordering::SeqCst)
+                            && !c.mailbox.priority_pending()
+                    });
+                    readiness = crate::onboarding::Readiness {
+                        generation,
+                        desktop_available: crate::window_tracking::stack()
+                            .is_some_and(|w| !w.is_empty()),
+                        ..Default::default()
+                    };
+                    match result {
+                        Ok(found) => {
+                            readiness.eligible_windows =
+                                found.iter().filter(|w| w.eligible).count();
+                            windows = found;
+                            discovery_complete = true;
+                        }
+                        Err(e) => {
+                            readiness.error = Some(if e.kind == ErrorKind::Cancelled {
+                                "Window check was interrupted or timed out. Close unresponsive apps and retry.".into()
+                            } else {
+                                e.to_string()
+                            });
+                        }
+                    }
+                    Ok(())
+                }
+                Some(Command::CompleteSetup(generation)) => {
+                    let result = complete_setup(&mut engine, setup_window, &persistence::path());
+                    if result.is_ok() {
+                        status = "Ready".into();
+                    }
+                    setup_completion = Some((
+                        generation,
+                        result.as_ref().map(|_| ()).map_err(ToString::to_string),
+                    ));
+                    result
+                }
                 Some(Command::Discover) => {
                     let epoch = c.mailbox.interruption.load(Ordering::SeqCst);
                     engine
@@ -371,6 +426,9 @@ pub fn start(workspace: Workspace) -> Client {
                         .map(|w| {
                             windows = w;
                             discovery_complete = true;
+                            if status.starts_with("Grant AppDock Accessibility") {
+                                status = "Add an existing window to begin.".into();
+                            }
                         })
                 }
                 Some(Command::SetKeepAppsOpen(value)) => {
@@ -422,7 +480,20 @@ pub fn start(workspace: Workspace) -> Client {
                 Some(Command::Attach(tab, id)) => {
                     dirty = true;
                     match windows.iter().find(|w| w.id == id) {
-                        Some(w) => engine.attach(tab, w).and_then(|id| engine.switch(id)),
+                        Some(w) => {
+                            engine
+                                .attach(tab, w)
+                                .and_then(|id| engine.switch(id))
+                                .map(|()| {
+                                    setup_window = engine
+                                        .selected
+                                        .and_then(|id| engine.live.get(&id))
+                                        .filter(|a| a.docked)
+                                        .and_then(|a| {
+                                            engine.backend.window_number(a.window).map(|_| a.window)
+                                        });
+                                })
+                        }
                         None => Err("Window list changed; refresh the picker.".into()),
                     }
                 }
@@ -477,9 +548,11 @@ pub fn start(workspace: Workspace) -> Client {
                     engine.paused = Some("Desktop changed".into());
                     apply_geometry(&mut engine, geometry, false)
                 }
-                Some(Command::Resume) => {
-                    apply_geometry(&mut engine, geometry, false).and_then(|()| engine.resume())
-                }
+                Some(Command::Resume) => apply_geometry(&mut engine, geometry, false)
+                    .and_then(|()| engine.resume())
+                    .map(|()| {
+                        status = "Ready".into();
+                    }),
                 Some(Command::RequestPermission) => {
                     crate::macos::request_permission();
                     Ok(())
@@ -522,6 +595,7 @@ pub fn start(workspace: Workspace) -> Client {
                 status = "Ready".into();
             }
             if discovery_complete
+                && engine.workspace.onboarding_completed
                 && geometry.is_some()
                 && !quitting
                 && engine.paused.is_none()
@@ -577,6 +651,12 @@ pub fn start(workspace: Workspace) -> Client {
             if next_observe <= Instant::now() {
                 next_observe = Instant::now() + Duration::from_millis(250);
             }
+            if !engine.backend.trusted() {
+                readiness = Default::default();
+                setup_window = None;
+                windows.clear();
+                discovery_complete = false;
+            }
             badges.retain(|id, _| engine.live.contains_key(id));
             *c.snapshot.lock().unwrap() = Snapshot {
                 workspace: engine.workspace.clone(),
@@ -609,6 +689,11 @@ pub fn start(workspace: Workspace) -> Client {
                         .unwrap_or_else(|| status.clone())
                 },
                 trusted: engine.backend.trusted(),
+                readiness: readiness.clone(),
+                setup_completion: setup_completion.clone(),
+                setup_docked: setup_window.is_some_and(|window| {
+                    engine.live.values().any(|a| a.window == window && a.docked)
+                }),
                 paused: engine.paused.is_some(),
                 stopped,
                 quitting,
@@ -658,6 +743,37 @@ pub fn start(workspace: Workspace) -> Client {
     client
 }
 
+/// Completion is persisted only after fresh readback of the tested window.
+fn complete_setup<B: WindowBackend>(
+    engine: &mut Engine<B>,
+    window: Option<WindowId>,
+    path: &std::path::Path,
+) -> Result<()> {
+    if !engine.backend.trusted() || engine.paused.is_some() {
+        return Err("Window control is unavailable or paused. Verify access and retry.".into());
+    }
+    let attachment = window
+        .and_then(|window| {
+            engine
+                .live
+                .values()
+                .find(|a| a.window == window && a.docked)
+        })
+        .ok_or("The tested window was released or closed. Dock a window again.")?;
+    let window = attachment.window;
+    let expected = attachment.expected.frame;
+    engine.backend.check_window(window)?;
+    let actual = engine.backend.state(window)?;
+    if actual.minimized || actual.fullscreen || actual.modal || !actual.frame.near(expected) {
+        return Err("The tested window changed. Leave fullscreen, close dialogs and resume docking before finishing.".into());
+    }
+    let mut workspace = engine.workspace.clone();
+    workspace.onboarding_completed = true;
+    persistence::save(path, &workspace)?;
+    engine.workspace = workspace;
+    Ok(())
+}
+
 /// Geometry persists independently of a cancellable movement command. Reading an
 /// older revision never consumes a newer request in the mailbox.
 fn apply_geometry<B: WindowBackend>(
@@ -679,6 +795,34 @@ fn apply_geometry<B: WindowBackend>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn setup_completion_requires_live_readback_and_a_successful_save() {
+        let root =
+            std::env::temp_dir().join(format!("appdock-setup-completion-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("workspace.json");
+        let mut engine = crate::engine::tests::fixture();
+        assert!(complete_setup(&mut engine, None, &path).is_err());
+        assert!(complete_setup(&mut engine, Some(1), &path).is_err());
+        engine.switch(1).unwrap();
+        engine.paused = Some("Permission revoked".into());
+        assert!(complete_setup(&mut engine, Some(1), &path).is_err());
+        engine.paused = None;
+        engine.backend.minimize(1, true).unwrap();
+        assert!(complete_setup(&mut engine, Some(1), &path).is_err());
+        engine.backend.minimize(1, false).unwrap();
+        let blocker = root.join("not-a-directory");
+        std::fs::write(&blocker, "fixture").unwrap();
+        assert!(complete_setup(&mut engine, Some(1), &blocker.join("workspace.json")).is_err());
+        assert!(!engine.workspace.onboarding_completed);
+        assert!(!path.exists());
+        complete_setup(&mut engine, Some(1), &path).unwrap();
+        assert!(persistence::load(&path).unwrap().onboarding_completed);
+        engine.release(1).unwrap();
+        assert!(complete_setup(&mut engine, Some(1), &path).is_err());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn editing_barrier_cancels_pending_focus_and_precedes_geometry() {
         let m = Mailbox::default();

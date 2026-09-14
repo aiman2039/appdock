@@ -6,6 +6,32 @@ use crate::{
 };
 use objc2_app_kit::{NSApplication, NSApplicationActivationPolicy, NSWorkspace};
 use objc2_foundation::MainThreadMarker;
+
+/// Emit evidence before any native initialization, which can abort rather than unwind.
+pub fn prepare_launch(mode: &str) -> Result<()> {
+    use std::io::Write;
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|e| e.to_string())?;
+    let mut stderr = std::io::stderr().lock();
+    writeln!(
+        stderr,
+        "AppDock diagnostic startup: mode={mode} pid={} unix_ms={}",
+        std::process::id(),
+        timestamp.as_millis()
+    )
+    .and_then(|_| stderr.flush())
+    .map_err(|e| e.to_string())?;
+    // This is a known launch-context signal, not a general sandbox detector.
+    if std::env::var_os("CODEX_SANDBOX").as_deref() == Some(std::ffi::OsStr::new("seatbelt")) {
+        return Err(BackendError::new(
+            ErrorKind::Permission,
+            "Native diagnostics cannot run inside the Codex seatbelt sandbox. Run this command from a normal macOS desktop terminal or approved execution outside the sandbox. Do not unset CODEX_SANDBOX to bypass this check.",
+        ));
+    }
+    Ok(())
+}
+
 /// Read only app names and Dock badge metadata for the user's messaging apps.
 pub fn badges() -> Result<()> {
     let m = MainThreadMarker::new().ok_or("Main thread required")?;
