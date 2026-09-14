@@ -21,9 +21,9 @@ Keep your open app windows organized and switch between them with a click.
 
 ## Take a look
 
-**Four apps, one workspace.** Keep WhatsApp, Spotify, Telegram, and Discord together.
+**Multiple apps, one workspace.** Keep WhatsApp, Spotify, Telegram, and Discord together.
 
-![AppDock with Discord, Spotify, WhatsApp, and Telegram tabs, with Telegram names and messages blurred](docs/screenshots/four-app-workspace.png)
+<img width="1198" height="771" alt="appdock" src="https://github.com/user-attachments/assets/3d854025-7e8f-498a-a7e2-a72ee42b9433" /> 
 
 **Your tabs at a glance.** See app icons, the selected tab, and notification badges.
 
