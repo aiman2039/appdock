@@ -19,11 +19,11 @@ open dist/AppDock.app
 
 ## GitHub releases
 
-The `Release` workflow builds native macOS Apple Silicon (`arm64`) and Intel (`x86_64`) apps with Rust 1.95.0, runs deterministic tests and lint checks on both architectures, and uploads `AppDock-vVERSION-macos-universal.dmg` and `.zip` assets with SHA-256 checksums. Both contain `AppDock.app`; the DMG adds the Finder installation layout. Signing and notarization use the `APPLE_*` secrets; Sparkle requires its separate public variable and private secret described in [UPDATES.md](UPDATES.md), while publishing uses the repository's `GITHUB_TOKEN`. No Docker is required.
+The `Release` workflow builds native macOS Apple Silicon (`arm64`) and Intel (`x86_64`) apps with the Rust toolchain pinned in `rust-toolchain.toml`, runs deterministic tests and lint checks on both architectures, and uploads `AppDock-vVERSION-macos-universal.dmg` and `.zip` assets with SHA-256 checksums. Both contain `AppDock.app`; the DMG adds the Finder installation layout. Signing and notarization use the `APPLE_*` secrets; Sparkle requires its separate public variable and private secret described in [UPDATES.md](UPDATES.md), while publishing uses the repository's `GITHUB_TOKEN`. No Docker is required.
 
 Set and commit the app version in `Cargo.toml`, then use **Actions → Release → Run workflow** and select the desired branch or revision. There is **no version/tag input**. The workflow derives `vVERSION` from the checked-out manifest, creates that tag if needed, and builds both architectures from the same immutable commit. An existing tag pointing to a different commit is rejected; bump the Cargo version before releasing new code under a new tag.
 
-The release workflow is **manual-only**: pushes and release-publication events do not start it. Rust caches are reused across manual runs on the selected branch and separate architecture, toolchain, compiler environment, and dependency state. Checks on `master` and pull requests use Rust 1.95.0 on Apple Silicon and Intel, plus stable Rust on Apple Silicon. The pinned jobs share their cache configuration with releases; `master` builds also warm release-profile dependencies. Repeated runs of the same release replace its named assets while preserving release notes.
+The release workflow is **manual-only**: pushes and release-publication events do not start it. Rust caches are reused across manual runs on the selected branch and separate architecture, toolchain, compiler environment, and dependency state. Checks on `master` and pull requests use `rust-toolchain.toml` on Apple Silicon and Intel, plus stable Rust on Apple Silicon. A separate Apple Silicon job checks the minimum Rust version declared in `Cargo.toml`. The pinned jobs share their cache configuration with releases; `master` builds also warm release-profile dependencies. Repeated runs of the same release replace its named assets while preserving release notes.
 
 Release app bundles and disk images are Developer ID signed, notarized, and stapled. Local packages are ad-hoc signed development builds. Hosted tests do not validate Accessibility permission or live desktop interactions. macOS 12 is the declared deployment minimum; release CI runs on macOS 15 and does not prove compatibility with every older version.
 
@@ -72,9 +72,9 @@ Edit these JSON keys while AppDock is closed to configure shortcuts:
 
 ## Verify
 
-Run `cargo test --locked` once after cloning to install the cargo-husky pre-commit hook. The hook runs `./scripts/check.sh`: formatting, compiler checks, Clippy with warnings denied, tests, and a build. Install the toolchain components with `rustup component add rustfmt clippy` if needed. Checks inspect the current working tree, including unstaged edits.
+Run `cargo test --locked` once after cloning to install the cargo-husky pre-commit hook. The hook runs `./scripts/check.sh`: formatting, compiler checks, Clippy with warnings denied, tests, and a build. Rustup installs the pinned compiler, rustfmt, and Clippy from `rust-toolchain.toml`. Checks inspect the current working tree, including unstaged edits.
 
-The same script runs in GitHub Actions on every push to `master`, on pull requests, and before release packaging. CI skips hook installation. Run it manually with `./scripts/check.sh`, or use `RUSTUP_TOOLCHAIN=1.95.0 ./scripts/check.sh` to match the pinned release toolchain.
+The same script runs in GitHub Actions on every push to `master`, on pull requests, and before release packaging. CI skips hook installation. Run it manually with `./scripts/check.sh`; local checks and releases both use `rust-toolchain.toml`.
 
 ```sh
 cargo fmt --all --check

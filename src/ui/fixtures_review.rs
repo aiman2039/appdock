@@ -346,9 +346,11 @@ fn backend_case(case: &str, pid: i32, dir: &Path) -> Result<()> {
         engine.backend.minimize(engine.live[&ids[0]].window, true)?;
         engine.observe();
         require(
-            engine.paused.is_some(),
-            "Minimization did not pause globally",
+            engine.paused.is_none() && engine.live[&ids[0]].issue == Some(DockIssue::Minimized),
+            "Minimization did not stay local to its tab",
         )?;
+        let minimized = engine.backend.state(engine.live[&ids[0]].window)?;
+        engine.paused = Some("Fixture desktop change".into());
         engine.resize(Rect {
             x: 460.,
             y: 260.,
@@ -356,7 +358,11 @@ fn backend_case(case: &str, pid: i32, dir: &Path) -> Result<()> {
             height: 350.,
         })?;
         engine.resume()?;
-        for id in &ids[..2] {
+        require(
+            engine.backend.state(engine.live[&ids[0]].window)? == minimized,
+            "Resume changed a user-minimized window",
+        )?;
+        for id in &ids[1..2] {
             let state = engine.backend.state(engine.live[id].window)?;
             require(
                 state.frame.near(engine.live[id].expected.frame)
@@ -365,6 +371,11 @@ fn backend_case(case: &str, pid: i32, dir: &Path) -> Result<()> {
                 "Resume left an inactive window behind",
             )?;
         }
+        engine.switch(ids[0])?;
+        require(
+            !engine.backend.state(engine.live[&ids[0]].window)?.minimized,
+            "Explicit selection did not restore the minimized tab",
+        )?;
         require(
             engine.backend.state(engine.live[&ids[2]].window)? == untouched,
             "Resume moved never-docked attachment",

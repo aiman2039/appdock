@@ -1,0 +1,3 @@
+Overflow height reproduction: old viewport before=34, after=17, tab height=32
+Overflow: arrows, end bounds, trackpad and mouse-wheel scrolling passed without a scrollbar or geometry change
+Overflow: selection reveal, manual scroll retention, full-height rename, tab removal and window resize passed

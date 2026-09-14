@@ -1,6 +1,8 @@
 //! AppKit stays on the main thread. The worker exchanges only owned Rust data.
 pub(crate) mod fixtures;
+mod fixtures_tabs;
 mod setup;
+mod tab_scroll;
 use crate::{
     appearance as theme,
     macos::App,
@@ -240,6 +242,7 @@ struct Ivars {
 }
 struct Ui {
     fixture: fixtures::FixtureState,
+    tabs_fixture: fixtures_tabs::State,
     setup_wizard: Option<setup::SetupUi>,
     setup_auto_shown: bool,
     client: Client,
@@ -248,8 +251,13 @@ struct Ui {
     window: Retained<NSWindow>,
     backdrop: crate::backdrop::Backdrop,
     tabs: Retained<NSView>,
+    tab_scroll: Retained<tab_scroll::TabScrollView>,
+    revealed_tab: Option<(TabId, usize)>,
     surface: Retained<WorkspaceSurface>,
     hint: Retained<NSTextField>,
+    recovery: Retained<NSView>,
+    recovery_message: Retained<NSTextField>,
+    restore_button: Retained<NSButton>,
     status: Retained<NSTextField>,
     permission_button: Retained<NSButton>,
     resume_button: Retained<NSButton>,
@@ -406,6 +414,17 @@ define_class!(
         #[unsafe(method(releaseTab:))] fn release(&self,_:&AnyObject){self.release_current();}
         #[unsafe(method(releaseThisTab:))] fn release_this(&self,sender:&NSButton){if let Some(u)=self.ivars().ui.borrow().as_ref(){u.client.send(Command::Release(sender.tag() as u64));}}
         #[unsafe(method(resumeDocking:))] fn resume(&self,_:&AnyObject){if let Some(u)=self.ivars().ui.borrow().as_ref(){u.client.send(Command::Resume);u.client.send(Command::Discover);}}
+        #[unsafe(method(restoreWindow:))] fn restore_window(&self,_:&AnyObject){
+            self.finish_rename(true);
+            if let Some(u)=self.ivars().ui.borrow().as_ref(){
+                let s=u.client.snapshot.lock().unwrap();
+                if s.trusted && !s.paused && s.selected_issue().is_some()
+                    && let Some(id)=s.selected && !u.client.is_switching_to(id) {
+                    u.restore_button.setEnabled(false);
+                    u.client.switch(id);
+                }
+            }
+        }
         #[unsafe(method(permission:))] fn permission(&self,_:&AnyObject){self.show_setup();}
         #[unsafe(method(spaceChanged:))] fn space(&self,_:&NSNotification){if let Some(u)=self.ivars().ui.borrow().as_ref(){u.client.send(Command::Pause);}}
         #[unsafe(method(dragTab:))] fn drag(&self,sender:&NSPanGestureRecognizer){if sender.state()==NSGestureRecognizerState::Ended && let Some(view)=sender.view(){let b=self.ivars().ui.borrow();if let Some(u)=b.as_ref(){let id=view.tag() as u64;let point=sender.locationInView(Some(&u.tabs));let index=(point.x/TAB_WIDTH).max(0.) as usize;u.client.send(Command::Reorder(id,index));}}}
@@ -512,6 +531,22 @@ impl Delegate {
                 },
             });
         }
+        if std::env::args().any(|a| a == "--tabs-smoke") {
+            assert!(
+                workspace.tabs.is_empty(),
+                "Tab fixture requires a fresh workspace"
+            );
+            for index in 0..12 {
+                workspace.tabs.push(SavedTab {
+                    id: index + 1,
+                    name: format!("Example app {}", index + 1),
+                    identity: Identity {
+                        bundle: format!("dev.appdock.tabs-fixture.{index}"),
+                        identifier: None,
+                    },
+                });
+            }
+        }
         let client = worker::start(workspace.clone());
         let window = unsafe {
             NSWindow::initWithContentRect_styleMask_backing_defer(
@@ -616,22 +651,11 @@ impl Delegate {
         let content = window.contentView().unwrap();
         let h = content.bounds().size.height;
         let w = content.bounds().size.width;
-        let scroll = NSScrollView::initWithFrame(
-            NSScrollView::alloc(m),
-            rect(FRAME, h - 36., w - 2. * FRAME, 34.),
-        );
-        scroll.setAutoresizingMask(
-            NSAutoresizingMaskOptions::ViewWidthSizable | NSAutoresizingMaskOptions::ViewMinYMargin,
-        );
-        scroll.setHasHorizontalScroller(true);
-        scroll.setAutohidesScrollers(true);
-        scroll.setDrawsBackground(false);
-        scroll.setClipsToBounds(true);
-        scroll.contentView().setClipsToBounds(true);
-        let tabs = NSView::initWithFrame(NSView::alloc(m), rect(0., 0., w - 2. * FRAME, 32.));
+        let scroll = tab_scroll::TabScrollView::new(m, &content);
+        let tabs = NSView::initWithFrame(NSView::alloc(m), rect(0., 0., 1., 32.));
         tabs.setClipsToBounds(true);
         scroll.setDocumentView(Some(&tabs));
-        content.addSubview(&scroll);
+        scroll.layout(content.bounds());
         let permission_button = self.button(
             "Allow window control…",
             sel!(permission:),
@@ -686,6 +710,35 @@ impl Delegate {
             NSAutoresizingMaskOptions::ViewWidthSizable | NSAutoresizingMaskOptions::ViewMinYMargin,
         );
         content.addSubview(&hint);
+        let recovery = NSView::initWithFrame(
+            NSView::alloc(m),
+            rect(FRAME, FRAME, w - 2. * FRAME, h - CHROME - 2. * FRAME),
+        );
+        recovery.setAutoresizingMask(
+            NSAutoresizingMaskOptions::ViewWidthSizable
+                | NSAutoresizingMaskOptions::ViewHeightSizable,
+        );
+        recovery.setHidden(true);
+        let recovery_message =
+            NSTextField::labelWithString(&NSString::from_str("Window minimized"), m);
+        recovery_message.setFont(Some(&theme::font(13.)));
+        recovery_message.setTextColor(Some(&theme::color(theme::TEXT)));
+        recovery_message.setFrame(rect(16., recovery.bounds().size.height - 96., w - 48., 72.));
+        recovery_message.setAutoresizingMask(
+            NSAutoresizingMaskOptions::ViewWidthSizable | NSAutoresizingMaskOptions::ViewMinYMargin,
+        );
+        if let Some(cell) = recovery_message.cell() {
+            cell.setWraps(true);
+        }
+        recovery.addSubview(&recovery_message);
+        let restore_button = self.button(
+            "Restore window",
+            sel!(restoreWindow:),
+            rect(16., recovery.bounds().size.height - 132., 156., 28.),
+        );
+        restore_button.setAutoresizingMask(NSAutoresizingMaskOptions::ViewMinYMargin);
+        recovery.addSubview(&restore_button);
+        content.addSubview(&recovery);
         let picker = crate::picker::InlinePicker::new(
             m,
             self,
@@ -712,13 +765,19 @@ impl Delegate {
         let _ = self.ivars().backdrop.set(backdrop.clone());
         *self.ivars().ui.borrow_mut() = Some(Ui {
             client,
+            tabs_fixture: Default::default(),
             setup_wizard: None,
             setup_auto_shown: is_fixture,
             window: window.clone(),
             backdrop,
             tabs,
+            tab_scroll: scroll,
+            revealed_tab: None,
             surface,
             hint,
+            recovery,
+            recovery_message,
+            restore_button,
             status,
             permission_button,
             resume_button,
@@ -746,6 +805,7 @@ impl Delegate {
             raise_after: None,
             fixture: fixtures::FixtureState {
                 fixture_child,
+                polish_minimize: None,
                 ..Default::default()
             },
             last_direct_window: None,
@@ -1159,7 +1219,14 @@ impl Delegate {
             Rect::from_cocoa(f.origin.x, f.origin.y, f.size.width, f.size.height, primary);
         let content = u.window.contentView().unwrap();
         let bounds = content.bounds();
+        u.tab_scroll.layout(bounds);
         u.picker.layout(rect(
+            FRAME,
+            FRAME,
+            bounds.size.width - 2. * FRAME,
+            (bounds.size.height - u.surface.chrome() - 2. * FRAME).max(100.),
+        ));
+        u.recovery.setFrame(rect(
             FRAME,
             FRAME,
             bounds.size.width - 2. * FRAME,
@@ -1345,6 +1412,10 @@ impl Delegate {
         u.client
             .set_pointer_down(NSEvent::pressedMouseButtons() != 0);
         let mut s = u.client.snapshot.lock().unwrap().clone();
+        if std::env::args().any(|a| a == "--tabs-smoke") && !(8..24).contains(&count) {
+            // Exercise the real rendering path as the visible list grows/shrinks.
+            s.workspace.tabs.truncate(3);
+        }
         self.update_startup_menu(&s);
         if publish {
             let targets = s
@@ -1402,6 +1473,22 @@ impl Delegate {
                 return;
             }
         }
+        let selected_issue = s.selected_issue();
+        // A minimized selected window has no native content to receive clicks.
+        // Make the owned replacement surface genuinely opaque before ordering it.
+        if u.window.isOpaque() != selected_issue.is_some() {
+            u.window.setOpaque(selected_issue.is_some());
+            let background = if selected_issue.is_some() {
+                theme::color(theme::SURFACE)
+            } else {
+                NSColor::clearColor()
+            };
+            u.window.setBackgroundColor(Some(&background));
+        }
+        if selected_issue.is_some() && u.surface.ivars().attached.get() {
+            u.surface.set_attached(false);
+            u.surface.displayIfNeeded();
+        }
         if !s.paused
             && u.rename_editor.is_none()
             && u.pending_rename.is_none()
@@ -1446,18 +1533,46 @@ impl Delegate {
             && u.window.isVisible()
             && !u.window.isMiniaturized()
             && !NSApplication::sharedApplication(self.mtm()).isHidden()
-            && let Some((number, frames)) = &s.backdrop
         {
             let primary = NSScreen::screens(self.mtm())
                 .firstObject()
                 .map(|s| s.frame().size.height)
                 .unwrap_or(900.);
-            u.backdrop.place(
-                *number,
-                Some(u.window.windowNumber() as u32),
-                frames,
-                primary,
-            );
+            if selected_issue.is_some() {
+                // The owned opaque surface replaces the missing selected window.
+                // Keep it above managed siblings without making AppDock key or
+                // bringing it above unrelated windows already ahead of the group.
+                if let Some(stack) = crate::window_tracking::stack()
+                    && let Some(manager) = stack
+                        .iter()
+                        .position(|w| w.number as isize == u.window.windowNumber())
+                    && let Some(member) = stack[..manager].iter().find(|w| {
+                        s.stacked_windows
+                            .iter()
+                            .any(|(_, number, _)| *number == w.number)
+                    })
+                {
+                    u.window.orderWindow_relativeTo(
+                        NSWindowOrderingMode::Above,
+                        member.number as isize,
+                    );
+                }
+                u.backdrop.place(
+                    u.window.windowNumber() as u32,
+                    None,
+                    &s.covered_frames,
+                    primary,
+                );
+            } else if let Some((number, frames)) = &s.backdrop {
+                u.backdrop.place(
+                    *number,
+                    Some(u.window.windowNumber() as u32),
+                    frames,
+                    primary,
+                );
+            } else {
+                u.backdrop.hide();
+            }
         } else {
             u.backdrop.hide();
         }
@@ -1470,8 +1585,22 @@ impl Delegate {
             u.window.setHasShadow(!attached);
         }
         let setup_visible = u.setup_wizard.as_ref().is_some_and(|setup| setup.visible());
+        let recovery_visible =
+            selected_issue.is_some() && !u.picker_open && !u.pending_picker && !setup_visible;
+        u.recovery.setHidden(!recovery_visible);
+        if let Some(issue) = selected_issue {
+            let restoring = s.selected.is_some_and(|id| u.client.is_switching_to(id));
+            let text = if restoring {
+                "Restoring window…"
+            } else {
+                issue.message()
+            };
+            u.recovery_message.setStringValue(&NSString::from_str(text));
+            u.restore_button
+                .setEnabled(!restoring && s.trusted && !s.paused && !s.quitting);
+        }
         u.surface
-            .set_attached(attached && !u.picker_open && !setup_visible);
+            .set_attached(attached && !u.picker_open && !setup_visible && selected_issue.is_none());
         u.hint.setHidden(attached || u.picker_open || setup_visible);
         if self.ivars().raise_requested.replace(false) {
             u.raise_after = Some(std::time::Instant::now() - std::time::Duration::from_millis(251));
@@ -1590,6 +1719,7 @@ impl Delegate {
         // Match the cached exact window number, not
         // merely its app: unrelated windows from the same process stay independent.
         if !s.paused
+            && selected_issue.is_none()
             && !s.quitting
             && !u.picker_open
             && !u.pending_picker
@@ -1708,8 +1838,8 @@ impl Delegate {
         }
         sync_selection(u, &s);
         let signature = format!(
-            "{:?}{:?}{:?}{:?}{:?}",
-            s.workspace.tabs, s.live, s.selected, u.editing, s.badges
+            "{:?}{:?}{:?}{:?}{:?}{:?}{:?}",
+            s.workspace.tabs, s.live, s.selected, u.editing, s.badges, s.issues, s.preparing
         );
         if signature != u.tab_signature
             && u.rename_editor.is_none()
@@ -1720,13 +1850,25 @@ impl Delegate {
                 view.removeFromSuperview();
             }
             u.tabs.setFrameSize(NSSize::new(
-                (s.workspace.tabs.len() as f64 * TAB_WIDTH).max(600.),
+                (s.workspace.tabs.len() as f64 * TAB_WIDTH).max(1.),
                 32.,
             ));
             for (i, t) in s.workspace.tabs.iter().enumerate() {
                 let connected = s.live.iter().find(|(id, _)| *id == t.id);
                 let label = if connected.is_none() {
                     format!("○ {}", t.name)
+                } else if s.preparing == Some(t.id) {
+                    format!(
+                        "{} · {}",
+                        t.name,
+                        if s.issues.iter().any(|(id, _)| *id == t.id) {
+                            "Restoring…"
+                        } else {
+                            "Opening…"
+                        }
+                    )
+                } else if s.issues.iter().any(|(id, _)| *id == t.id) {
+                    format!("{} · Restore", t.name)
                 } else {
                     t.name.clone()
                 };
@@ -1795,7 +1937,32 @@ impl Delegate {
                 u.tabs.addSubview(&close);
             }
         }
+        u.tab_scroll.layout(u.surface.bounds());
+        let reveal = u
+            .rename_editor
+            .as_ref()
+            .map(|editor| editor.id)
+            .or(u.pending_rename)
+            .or(s.preparing)
+            .or(s.selected)
+            .or(u.editing)
+            .and_then(|id| {
+                s.workspace
+                    .tabs
+                    .iter()
+                    .position(|tab| tab.id == id)
+                    .map(|index| (id, index))
+            });
+        if reveal != u.revealed_tab && NSEvent::pressedMouseButtons() == 0 {
+            if let Some((_, index)) = reveal {
+                u.tab_scroll.reveal_tab(index);
+            }
+            u.revealed_tab = reveal;
+        }
         drop(b);
+        if std::env::args().any(|a| a == "--tabs-smoke") {
+            self.tabs_fixture_step(count);
+        }
         self.filter();
     }
     fn filter(&self) {
@@ -1927,7 +2094,9 @@ impl Delegate {
             let s = u.client.snapshot.lock().unwrap();
             let attached = s
                 .selected
-                .is_some_and(|id| s.live.iter().any(|(tab, _)| *tab == id));
+                .is_some_and(|id| s.live.iter().any(|(tab, _)| *tab == id))
+                && s.selected_issue().is_none();
+            let show_hint = s.selected.is_none();
             (
                 u.window.clone(),
                 u.picker.view.clone(),
@@ -1935,14 +2104,15 @@ impl Delegate {
                 u.hint.clone(),
                 u.client.clone(),
                 attached,
+                show_hint,
             )
         };
-        let (window, view, surface, hint, client, attached) = pending;
+        let (window, view, surface, hint, client, attached, show_hint) = pending;
         self.ivars().rename_field.set(None);
         window.makeFirstResponder(None);
         view.setHidden(true);
         surface.set_attached(attached);
-        hint.setHidden(attached);
+        hint.setHidden(!show_hint);
         client.set_text_editing(false);
         if raise {
             client.send(Command::Raise);
@@ -2008,6 +2178,7 @@ impl Delegate {
                 return;
             };
             u.editing = Some(id);
+            u.tab_scroll.reveal_tab(index);
             (
                 u.tabs.clone(),
                 u.window.clone(),

@@ -1,0 +1,21 @@
+Disposable frame target process: 63139
+Preview window ID: 17986
+Inline picker visible: 17986
+Inline picker visible: 17986
+Fixture keyboard context: active=true, key_window=true, foreground_manager=true, foreground_child=false
+Inline picker visible: 17986
+Inline picker visible: 17986
+Fixture keyboard context: active=true, key_window=true, foreground_manager=true, foreground_child=false
+Integrated inline picker attachment submitted
+Inline picker visible: 17986
+Inline picker visible: 17986
+Fixture keyboard context: active=true, key_window=true, foreground_manager=true, foreground_child=false
+Integrated inline picker attachment submitted
+Polish: waiting for native minimize/order transition, tick=0, hit=17989, manager=17986, members=[(1, 17989, 63139), (2, 17988, 63139)]
+Native pointer routing passed: app content targets the external app; tab controls target AppDock
+Polish: selected minimize kept workspace usable; opaque Restore surface, pointer routing, actual Restore button, and picker actions passed
+Polish: waiting for native minimize/order transition, tick=0, hit=17988, manager=17986, members=[(1, 17989, 63139), (2, 17988, 63139)]
+Native pointer routing passed: app content targets the external app; tab controls target AppDock
+Polish: healthy tab switched, moved and resized while the inactive tab stayed minimized
+Polish: explicit tab selection restored its window; closing restores original geometry
+Integrated restoration complete

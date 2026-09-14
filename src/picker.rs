@@ -112,10 +112,11 @@ pub struct InlinePicker {
     refresh: Retained<NSButton>,
     cancel: Retained<NSButton>,
     diagnostics: Retained<NSButton>,
-    attach: Retained<NSButton>,
+    pub(crate) attach: Retained<NSButton>,
     rows: Vec<Retained<ChoiceRow>>,
     pub choice_ids: Vec<WindowId>,
     selected: Option<WindowId>,
+    minimized: Vec<WindowId>,
     signature: String,
 }
 impl InlinePicker {
@@ -199,6 +200,7 @@ impl InlinePicker {
             rows: vec![],
             choice_ids: vec![],
             selected: None,
+            minimized: vec![],
             signature: String::new(),
         };
         picker.layout(frame);
@@ -275,7 +277,11 @@ impl InlinePicker {
         }
         self.attach.setEnabled(self.selected().is_some());
         self.attach.setAttributedTitle(&attributed(
-            "Attach window",
+            if self.selected.is_some_and(|id| self.minimized.contains(&id)) {
+                "Restore & Add"
+            } else {
+                "Attach window"
+            },
             if self.selected().is_some() {
                 theme::TEXT
             } else {
@@ -298,6 +304,11 @@ impl InlinePicker {
         self.signature = signature;
         let previous = self.selected;
         self.choice_ids = windows.iter().map(|w| w.id).collect();
+        self.minimized = windows
+            .iter()
+            .filter(|w| w.minimized)
+            .map(|w| w.id)
+            .collect();
         self.selected = previous
             .filter(|id| self.choice_ids.contains(id))
             .or_else(|| {

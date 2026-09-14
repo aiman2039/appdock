@@ -135,6 +135,20 @@ pub struct WindowState {
     pub fullscreen: bool,
     pub modal: bool,
 }
+/// A local interruption retains ownership without stopping unrelated tabs.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DockIssue {
+    Minimized,
+    Restore(String),
+}
+impl DockIssue {
+    pub fn message(&self) -> &str {
+        match self {
+            Self::Minimized => "Window minimized",
+            Self::Restore(message) => message,
+        }
+    }
+}
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Restoration {
     Exact,

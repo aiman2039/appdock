@@ -341,6 +341,19 @@ pub fn request_permission() {
         objc2_application_services::AXIsProcessTrustedWithOptions(Some(&options));
     }
 }
+/// Native fixtures supply only the PID of their own disposable child.
+pub fn minimize_focused_fixture(pid: i32, expected_number: u32) -> Result<()> {
+    let app = unsafe { AXUIElement::new_application(pid) };
+    let window = AX
+        .attr(&app, "AXFocusedWindow")?
+        .downcast::<AXUIElement>()
+        .map_err(|_| "Fixture has no focused window")?;
+    let state = AX.state(&window)?;
+    if crate::window_tracking::focused_number(pid, state.frame) != Some(expected_number) {
+        return Err("Fixture focus changed before minimization".into());
+    }
+    AX.set_bool(&window, "AXMinimized", true)
+}
 impl MacBackend {
     pub fn new() -> Self {
         Self {

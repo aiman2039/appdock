@@ -20,20 +20,21 @@ jobs:
       matrix:
         include:
           - runner: macos-15
-            toolchain: '1.95.0'
+            toolchain: pinned
           - runner: macos-15-intel
-            toolchain: '1.95.0'
+            toolchain: pinned
           - runner: macos-15
             toolchain: stable
-    env:
-      RUSTUP_TOOLCHAIN: ${{ matrix.toolchain }}
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - name: Test release revision handling
         run: python3 scripts/test-release-revision.py
+      - name: Select stable compatibility toolchain
+        if: matrix.toolchain == 'stable'
+        run: echo "RUSTUP_TOOLCHAIN=stable" >> "$GITHUB_ENV"
       - name: Install Rust
-        run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --component rustfmt --component clippy
+        run: rustup toolchain install --component rustfmt --component clippy
       - name: Cache Rust dependencies and build artifacts
         uses: Swatinem/rust-cache@v2
         with:
@@ -43,10 +44,25 @@ jobs:
           env-vars: CARGO CC CFLAGS CXX CMAKE RUST MACOSX_DEPLOYMENT_TARGET SDKROOT
       - name: Format, check, Clippy, test, and build
         run: ./scripts/check.sh
-      - name: Check declared minimum Rust version
-        if: matrix.toolchain == '1.95.0'
-        run: |
-          python3 -c 'import tomllib; assert tomllib.load(open("Cargo.toml", "rb"))["package"]["rust-version"] == "1.95"'
       - name: Warm release build dependencies
-        if: github.event_name == 'push' && matrix.toolchain == '1.95.0'
+        if: github.event_name == 'push' && matrix.toolchain == 'pinned'
         run: cargo build --release --locked
+
+  minimum-rust:
+    runs-on: macos-15
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Select declared minimum Rust version
+        run: |
+          python3 - <<'PYTHON' >> "$GITHUB_ENV"
+          import tomllib
+          with open("Cargo.toml", "rb") as manifest:
+              version = tomllib.load(manifest)["package"]["rust-version"]
+          print(f"RUSTUP_TOOLCHAIN={version}")
+          PYTHON
+      - name: Install Rust
+        run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal
+      - uses: Swatinem/rust-cache@v2
+      - name: Check minimum Rust compatibility
+        run: cargo check --all-targets --all-features --locked

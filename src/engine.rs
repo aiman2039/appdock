@@ -7,6 +7,7 @@ pub struct Attachment {
     pub original: WindowState,
     pub expected: WindowState,
     pub docked: bool,
+    pub issue: Option<DockIssue>,
     /// Startup registration has not attempted to control this window yet.
     pub deferred_startup: bool,
 }
@@ -110,6 +111,7 @@ impl<B: WindowBackend> Engine<B> {
                 original,
                 expected: original,
                 docked: false,
+                issue: original.minimized.then_some(DockIssue::Minimized),
                 deferred_startup: false,
             },
         );
@@ -184,6 +186,9 @@ impl<B: WindowBackend> Engine<B> {
             .ok_or("Disconnected tab: select Replace window")?
             .clone();
         let before = self.backend.state(next.window)?;
+        if before.minimized {
+            self.live.get_mut(&id).unwrap().issue = Some(DockIssue::Minimized);
+        }
         if before.fullscreen || before.modal {
             self.paused = Some("Fullscreen or dialog is active".into());
             return Err("Close the dialog or leave fullscreen, then Resume.".into());
@@ -207,10 +212,23 @@ impl<B: WindowBackend> Engine<B> {
         let prepared: Result<Rect> = (|| {
             if before.minimized {
                 self.backend.minimize(next.window, false)?;
+            }
+            if before.minimized || next.issue.is_some() {
                 self.backend
                     .validate_restored_window(next.window, &current)?;
             }
-            let frame = self.backend.set_frame(next.window, self.area)?;
+            // Only reuse a freshly read, previously accepted docking frame.
+            // Restored, moved, and constrained/mismatching targets still settle.
+            let frame = if next.docked
+                && next.issue.is_none()
+                && !before.minimized
+                && before.frame.near(next.expected.frame)
+                && before.frame.near(self.area)
+            {
+                before.frame
+            } else {
+                self.backend.set_frame(next.window, self.area)?
+            };
             if !current() {
                 return Err(BackendError::cancelled());
             }
@@ -221,19 +239,29 @@ impl<B: WindowBackend> Engine<B> {
             Ok(f) => f,
             Err(e) => {
                 let rollback = self.backend.restore(next.window, before);
-                if let Some(old) = self.selected.and_then(|id| self.live.get(&id)) {
+                if let Some(old) = self
+                    .selected
+                    .and_then(|id| self.live.get(&id))
+                    .filter(|a| a.issue.is_none())
+                {
                     let _ = self.backend.focus(old.window);
                 }
                 let mut error = e.context("Switch failed");
                 if let Err(rollback) = rollback {
                     error.causes.push(rollback.context("Rollback"));
+                    self.live.get_mut(&id).unwrap().issue =
+                        Some(DockIssue::Restore(error.to_string()));
                 }
                 return Err(error);
             }
         };
         if !current() {
             self.backend.restore(next.window, before)?;
-            if let Some(old) = self.selected.and_then(|id| self.live.get(&id)) {
+            if let Some(old) = self
+                .selected
+                .and_then(|id| self.live.get(&id))
+                .filter(|a| a.issue.is_none())
+            {
                 let _ = self.backend.focus(old.window);
             }
             return Ok(());
@@ -241,6 +269,7 @@ impl<B: WindowBackend> Engine<B> {
         self.selected = Some(id);
         if let Some(a) = self.live.get_mut(&id) {
             a.docked = true;
+            a.issue = None;
             a.expected = WindowState {
                 frame,
                 minimized: false,
@@ -254,11 +283,19 @@ impl<B: WindowBackend> Engine<B> {
         if self.paused.is_some() {
             return Ok(());
         }
-        for a in self.live.values_mut().filter(|a| a.docked) {
+        for a in self
+            .live
+            .values_mut()
+            .filter(|a| a.docked && a.issue.is_none())
+        {
             let state = self.backend.state(a.window)?;
             if state.fullscreen || state.modal {
                 self.paused = Some("Fullscreen or dialog is active".into());
                 return Ok(());
+            }
+            if state.minimized {
+                a.issue = Some(DockIssue::Minimized);
+                continue;
             }
             if !state.frame.near(a.expected.frame) || state.minimized != a.expected.minimized {
                 // The observer restores the target after the user releases the mouse.
@@ -327,7 +364,11 @@ impl<B: WindowBackend> Engine<B> {
         if self.paused.is_some() {
             return Ok(());
         }
-        for a in self.live.values_mut().filter(|a| a.docked) {
+        for a in self
+            .live
+            .values_mut()
+            .filter(|a| a.docked && a.issue.is_none())
+        {
             // Position-only AX writes preserve app-enforced size limits and avoid
             // resize IPC, settling sleeps, and repeated full-state reads per pixel.
             self.backend.move_window(a.window, area.x, area.y)?;
@@ -422,14 +463,36 @@ impl<B: WindowBackend> Engine<B> {
                     {
                         let expected = a.expected;
                         match self.backend.state(w) {
-                            Ok(state)
-                                if state.fullscreen
-                                    || state.modal
-                                    || state.minimized != expected.minimized =>
-                            {
-                                self.paused = Some(
-                                    "Target minimized or entered fullscreen/dialog state".into(),
-                                );
+                            Ok(state) if state.fullscreen || state.modal => {
+                                self.paused = Some("Target entered fullscreen/dialog state".into());
+                            }
+                            Ok(state) if state.minimized => {
+                                self.live.get_mut(&id).unwrap().issue = Some(DockIssue::Minimized);
+                            }
+                            // Failed readiness needs an explicit retry, not a polling loop.
+                            Ok(_) if matches!(a.issue, Some(DockIssue::Restore(_))) => {}
+                            Ok(_) if a.issue.is_some() => {
+                                // A user may restore through the Dock. Revalidate before
+                                // moving it again, but never steal focus during polling.
+                                if self.paused.is_none() && !self.pointer_down {
+                                    let restored = self
+                                        .backend
+                                        .validate_restored_window(w, &|| true)
+                                        .and_then(|()| self.backend.set_frame(w, self.area));
+                                    let a = self.live.get_mut(&id).unwrap();
+                                    match restored {
+                                        Ok(frame) => {
+                                            a.expected.frame = frame;
+                                            a.expected.minimized = false;
+                                            a.issue = None;
+                                        }
+                                        Err(e) if e.kind == ErrorKind::Cancelled => {}
+                                        Err(e) if e.kind == ErrorKind::Permission => {
+                                            self.paused = Some(e.to_string());
+                                        }
+                                        Err(e) => a.issue = Some(DockIssue::Restore(e.to_string())),
+                                    }
+                                }
                             }
                             Ok(state)
                                 if !state.frame.near(expected.frame)
@@ -445,6 +508,10 @@ impl<B: WindowBackend> Engine<B> {
                                     }
                                     Err(e) => self.paused = Some(e.to_string()),
                                 }
+                            }
+                            Err(e) if a.issue.is_some() && e.kind != ErrorKind::Permission => {
+                                self.live.get_mut(&id).unwrap().issue =
+                                    Some(DockIssue::Restore(e.to_string()));
                             }
                             Err(e) if !self.pointer_down => self.paused = Some(e.to_string()),
                             _ => {}
@@ -485,19 +552,22 @@ impl<B: WindowBackend> Engine<B> {
             for id in ids {
                 let a = self.live.get_mut(&id).unwrap();
                 if states[&id].minimized {
-                    self.backend.minimize(a.window, false)?;
-                    a.expected.minimized = false;
+                    a.issue = Some(DockIssue::Minimized);
+                    continue;
+                }
+                if a.issue.is_some() {
                     self.backend.validate_restored_window(a.window, &|| true)?;
                 }
                 a.expected.frame = self.backend.set_frame(a.window, self.area)?;
                 a.expected.minimized = false;
                 a.expected.fullscreen = false;
                 a.expected.modal = false;
+                a.issue = None;
             }
             if let Some(a) = self
                 .selected
                 .and_then(|id| self.live.get(&id))
-                .filter(|a| a.docked)
+                .filter(|a| a.docked && a.issue.is_none())
             {
                 self.backend.focus(a.window)?;
             }
@@ -537,6 +607,7 @@ pub(crate) mod tests {
         lifecycle_error: Option<BackendError>,
         resize_error: Option<BackendError>,
         fail_restored_validation: bool,
+        restored_validations: std::cell::Cell<usize>,
         watched: std::collections::HashSet<WindowId>,
     }
     impl WindowBackend for Fake {
@@ -614,6 +685,8 @@ pub(crate) mod tests {
             _id: WindowId,
             current: &dyn Fn() -> bool,
         ) -> Result<()> {
+            self.restored_validations
+                .set(self.restored_validations.get() + 1);
             if !current() {
                 return Err(BackendError::cancelled());
             }
@@ -693,6 +766,47 @@ pub(crate) mod tests {
         assert!(e.switch(2).is_err());
         assert_eq!(e.selected, Some(1));
         assert!(!e.backend.states[&1].minimized);
+    }
+    #[test]
+    fn ready_switch_skips_resize_but_still_requires_focus() {
+        let mut e = fixture();
+        e.switch(1).unwrap();
+        e.switch(2).unwrap();
+        let resizes = e.backend.resizes;
+        e.backend.fail_resize = true;
+        e.switch(1).unwrap();
+        assert_eq!(e.backend.resizes, resizes);
+        assert_eq!(e.backend.focused, Some(1));
+        e.backend.fail_focus = true;
+        assert!(e.switch(2).is_err());
+        assert_eq!(e.selected, Some(1));
+        assert_eq!(e.backend.resizes, resizes);
+    }
+    #[test]
+    fn moved_or_newly_sized_target_does_not_use_ready_switch_shortcut() {
+        let mut e = fixture();
+        e.switch(1).unwrap();
+        e.switch(2).unwrap();
+        let resizes = e.backend.resizes;
+        e.backend.states.get_mut(&1).unwrap().frame.x += 50.;
+        e.switch(1).unwrap();
+        assert_eq!(e.backend.resizes, resizes + 1);
+        assert_eq!(e.backend.states[&1].frame, e.area);
+        e.area.width += 100.;
+        e.switch(2).unwrap();
+        assert_eq!(e.backend.resizes, resizes + 2);
+        assert_eq!(e.backend.states[&2].frame, e.area);
+    }
+    #[test]
+    fn minimized_target_revalidates_and_settles_even_at_the_docking_frame() {
+        let mut e = fixture();
+        e.switch(1).unwrap();
+        let resizes = e.backend.resizes;
+        e.backend.states.get_mut(&1).unwrap().minimized = true;
+        e.switch(1).unwrap();
+        assert_eq!(e.backend.resizes, resizes + 1);
+        assert_eq!(e.backend.restored_validations.get(), 1);
+        assert_eq!(e.backend.minimize_calls, vec![(1, false)]);
     }
     #[test]
     fn switching_does_not_require_minimizing_previous_window() {
@@ -1013,7 +1127,6 @@ pub(crate) mod tests {
             ..e.area
         })
         .unwrap();
-        e.backend.states.get_mut(&1).unwrap().minimized = true;
         e.resume().unwrap();
         for id in 1..=2 {
             assert_eq!(e.backend.states[&id].frame, e.area);
@@ -1108,26 +1221,129 @@ pub(crate) mod tests {
         assert!(e.paused.is_some());
     }
     #[test]
-    fn d2_minimizing_one_window_pauses_all_docking_until_full_resume() {
+    fn minimized_inactive_tab_does_not_pause_move_resize_or_switch_of_healthy_tabs() {
         let mut e = fixture();
         e.switch(1).unwrap();
         e.switch(2).unwrap();
         e.backend.states.get_mut(&1).unwrap().minimized = true;
         e.backend.events.push(BackendEvent::Changed(1));
         e.observe();
-        assert!(e.paused.is_some());
-        let before = e.backend.states.clone();
+        assert!(e.paused.is_none());
+        assert_eq!(e.live[&1].issue, Some(DockIssue::Minimized));
+        let before = e.backend.states[&1];
         e.follow_workspace(Rect { x: 999., ..e.area }).unwrap();
-        let error = e.switch(1).unwrap_err();
-        assert!(error.to_string().contains("Select Resume"));
-        assert_eq!(e.backend.states, before);
+        e.resize(Rect {
+            width: 1100.,
+            ..e.area
+        })
+        .unwrap();
+        e.switch(2).unwrap();
+        assert_eq!(e.backend.states[&1], before);
+        assert_eq!(e.backend.states[&2].frame, e.area);
+        e.switch(1).unwrap();
+        assert!(e.live[&1].issue.is_none());
+        assert!(!e.backend.states[&1].minimized);
+        assert_eq!(e.backend.states[&1].frame, e.area);
+    }
+    #[test]
+    fn selected_minimize_keeps_selection_and_original_snapshot_without_focus_writes() {
+        let mut e = fixture();
+        e.switch(1).unwrap();
+        let original = e.live[&1].original;
+        let resizes = e.backend.resizes;
+        e.backend.focused = None;
+        e.backend.states.get_mut(&1).unwrap().minimized = true;
+        e.backend.events.push(BackendEvent::Changed(1));
+        e.observe();
+        assert_eq!(e.selected, Some(1));
+        assert_eq!(e.live[&1].issue, Some(DockIssue::Minimized));
+        assert_eq!(e.live[&1].original, original);
+        assert_eq!(e.backend.resizes, resizes);
+        assert_eq!(e.backend.focused, None);
+        assert!(e.paused.is_none());
+        e.switch(2).unwrap();
+        assert!(e.backend.states[&1].minimized);
+        assert_eq!(e.selected, Some(2));
+    }
+    #[test]
+    fn failed_minimized_restore_remains_local_and_other_tabs_stay_usable() {
+        let mut e = fixture();
+        e.switch(1).unwrap();
+        e.backend.states.get_mut(&1).unwrap().minimized = true;
+        e.backend.events.push(BackendEvent::Changed(1));
+        e.observe();
+        let original = e.live[&1].original;
+        e.backend.fail_restored_validation = true;
+        assert!(e.switch(1).is_err());
+        assert!(e.backend.states[&1].minimized);
+        assert_eq!(e.live[&1].original, original);
+        assert!(e.paused.is_none());
+        e.switch(2).unwrap();
+        assert_eq!(e.selected, Some(2));
+        e.backend.fail_restored_validation = false;
+        e.switch(1).unwrap();
+        e.release(1).unwrap();
+        assert_eq!(e.backend.states[&1], original);
+    }
+    #[test]
+    fn external_restore_revalidates_without_focus_and_failed_readiness_waits_for_retry() {
+        let mut e = fixture();
+        e.switch(1).unwrap();
+        e.backend.states.get_mut(&1).unwrap().minimized = true;
+        e.backend.events.push(BackendEvent::Changed(1));
+        e.observe();
+        e.backend.focused = None;
+        e.backend.states.get_mut(&1).unwrap().minimized = false;
+        e.backend.fail_restored_validation = true;
+        e.backend.events.push(BackendEvent::Changed(1));
+        e.observe();
+        assert!(matches!(e.live[&1].issue, Some(DockIssue::Restore(_))));
+        assert!(e.paused.is_none());
+        assert_eq!(e.backend.restored_validations.get(), 1);
+        e.backend.events.push(BackendEvent::Changed(1));
+        e.observe();
+        assert_eq!(e.backend.restored_validations.get(), 1);
+        assert_eq!(e.backend.focused, None);
+        e.backend.fail_restored_validation = false;
+        e.switch(1).unwrap();
+        assert!(e.live[&1].issue.is_none());
+    }
+    #[test]
+    fn resume_preserves_minimized_tabs_until_explicit_selection() {
+        let mut e = fixture();
+        e.switch(1).unwrap();
+        e.switch(2).unwrap();
+        e.paused = Some("Desktop changed".into());
+        e.area.x += 100.;
+        e.backend.states.get_mut(&1).unwrap().minimized = true;
+        let before = e.backend.states[&1];
         e.resume().unwrap();
-        assert!(
-            e.backend
-                .states
-                .values()
-                .all(|s| s.frame == e.area && !s.minimized)
-        );
+        assert_eq!(e.backend.states[&1], before);
+        assert_eq!(e.live[&1].issue, Some(DockIssue::Minimized));
+        assert_eq!(e.backend.states[&2].frame, e.area);
+        assert_eq!(e.backend.focused, Some(2));
+        assert!(e.paused.is_none());
+    }
+    #[test]
+    fn minimized_tabs_do_not_bypass_modal_fullscreen_or_permission_safeguards() {
+        for interruption in ["modal", "fullscreen", "permission"] {
+            let mut e = fixture();
+            e.switch(1).unwrap();
+            e.backend.states.get_mut(&1).unwrap().minimized = true;
+            match interruption {
+                "modal" => e.backend.states.get_mut(&1).unwrap().modal = true,
+                "fullscreen" => e.backend.states.get_mut(&1).unwrap().fullscreen = true,
+                _ => e.backend.permission_lost = true,
+            }
+            e.backend.events.push(if interruption == "permission" {
+                BackendEvent::PermissionLost
+            } else {
+                BackendEvent::Changed(1)
+            });
+            e.observe();
+            assert!(e.paused.is_some());
+            assert!(e.switch(2).is_err());
+        }
     }
     #[test]
     fn a1_replacement_handle_restores_original_detached_snapshot() {

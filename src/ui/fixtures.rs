@@ -20,6 +20,10 @@ pub(super) struct FixtureState {
     pub(super) fixture_keyboard_ready: bool,
     pub(super) startup_menu_stage: u8,
     pub(super) settings_popup_stage: u8,
+    pub(super) polish_stage: u8,
+    pub(super) polish_selected: Option<TabId>,
+    pub(super) polish_minimize: Option<std::thread::JoinHandle<Result<()>>>,
+    pub(super) polish_issue_tick: Option<u64>,
 }
 impl Drop for FixtureState {
     fn drop(&mut self) {
@@ -269,6 +273,232 @@ impl Delegate {
         s: &Snapshot,
     ) -> Option<RefMut<'a, Option<Ui>>> {
         let u = b.as_mut()?;
+        if std::env::var_os("APPDOCK_POLISH_SMOKE").is_some()
+            && u.fixture.dock_test_stage == 2
+            && s.live.len() == 2
+        {
+            assert!(
+                count <= 500,
+                "Polish fixture timed out at stage {}: {}",
+                u.fixture.polish_stage,
+                s.status
+            );
+            let first = s.workspace.tabs[0].id;
+            let second = s.workspace.tabs[1].id;
+            if let Some(job) = &u.fixture.polish_minimize {
+                if !job.is_finished() {
+                    return None;
+                }
+                u.fixture
+                    .polish_minimize
+                    .take()
+                    .unwrap()
+                    .join()
+                    .expect("Minimize worker panicked")
+                    .expect("Native minimize failed");
+            }
+            match u.fixture.polish_stage {
+                0 | 3
+                    if s.preparing.is_none()
+                        && (u.fixture.polish_stage == 0 || s.selected == Some(first))
+                        && s.selected_frame.is_some_and(|frame| frame.near(s.area)) =>
+                {
+                    let id = s.selected.unwrap();
+                    let number = s.backdrop.as_ref().unwrap().0;
+                    let pid = u
+                        .fixture
+                        .fixture_child
+                        .as_ref()
+                        .expect("Disposable targets required")
+                        .id() as i32;
+                    u.fixture.polish_selected = Some(id);
+                    u.fixture.polish_issue_tick = None;
+                    u.fixture.polish_minimize = Some(std::thread::spawn(move || {
+                        crate::macos::minimize_focused_fixture(pid, number)
+                    }));
+                    u.fixture.polish_stage += 1;
+                    return None;
+                }
+                1 | 4 if s.selected_issue() == Some(&DockIssue::Minimized) => {
+                    assert!(!s.paused);
+                    assert_eq!(s.selected, u.fixture.polish_selected);
+                    assert!(!u.recovery.isHidden(), "Minimized placeholder is missing");
+                    assert!(
+                        !u.surface.ivars().attached.get(),
+                        "Minimized placeholder is transparent"
+                    );
+                    assert!(u.restore_button.isEnabled());
+                    let center = u
+                        .window
+                        .convertRectToScreen(rect(u.surface.bounds().size.width / 2., 100., 1., 1.))
+                        .origin;
+                    let first_issue = *u.fixture.polish_issue_tick.get_or_insert(count);
+                    let hit = NSWindow::windowNumberAtPoint_belowWindowWithWindowNumber(
+                        center,
+                        0,
+                        self.mtm(),
+                    );
+                    if hit != u.window.windowNumber() && count - first_issue < 8 {
+                        println!(
+                            "Polish: waiting for native minimize/order transition, tick={}, hit={}, manager={}, members={:?}",
+                            count - first_issue,
+                            hit,
+                            u.window.windowNumber(),
+                            s.stacked_windows
+                        );
+                        return None;
+                    }
+                    assert_eq!(
+                        hit,
+                        u.window.windowNumber(),
+                        "Inactive content intercepts the placeholder"
+                    );
+                    if u.fixture.polish_stage == 1 {
+                        let bounds = u.surface.bounds();
+                        let bitmap = u
+                            .surface
+                            .bitmapImageRepForCachingDisplayInRect(bounds)
+                            .expect("Recovery bitmap unavailable");
+                        u.surface
+                            .cacheDisplayInRect_toBitmapImageRep(bounds, &bitmap);
+                        assert!(
+                            bitmap
+                                .colorAtX_y(bitmap.pixelsWide() / 2, bitmap.pixelsHigh() / 2)
+                                .unwrap()
+                                .alphaComponent()
+                                > 0.99,
+                            "Recovery content is not opaque"
+                        );
+                        if let Ok(output) = std::env::var("APPDOCK_SMOKE_SCREENSHOT") {
+                            let data = unsafe {
+                                bitmap.representationUsingType_properties(
+                                    NSBitmapImageFileType::PNG,
+                                    &objc2_foundation::NSDictionary::new(),
+                                )
+                            }
+                            .expect("Recovery PNG encoding failed");
+                            assert!(
+                                data.writeToFile_atomically(&NSString::from_str(&output), true)
+                            );
+                        }
+                        let mut candidate = s
+                            .windows
+                            .iter()
+                            .find(|w| {
+                                s.live
+                                    .iter()
+                                    .any(|(id, window)| Some(*id) == s.selected && *window == w.id)
+                            })
+                            .unwrap()
+                            .clone();
+                        candidate.minimized = true;
+                        u.picker.render(self.mtm(), self, vec![&candidate], "");
+                        assert_eq!(
+                            u.picker.attach.attributedTitle().string().to_string(),
+                            "Restore & Add"
+                        );
+                        candidate.minimized = false;
+                        u.picker.render(self.mtm(), self, vec![&candidate], "");
+                        assert_eq!(
+                            u.picker.attach.attributedTitle().string().to_string(),
+                            "Attach window"
+                        );
+                        u.picker
+                            .render(self.mtm(), self, vec![], "Window no longer available");
+                        assert!(!u.picker.attach.isEnabled());
+                        let button = u.restore_button.clone();
+                        u.fixture.polish_stage = 2;
+                        drop(b);
+                        unsafe {
+                            button.performClick(None);
+                        }
+                        assert!(
+                            !button.isEnabled(),
+                            "Repeated restore submission is still enabled"
+                        );
+                        return None;
+                    }
+                    u.client.switch(second);
+                    u.fixture.polish_stage = 5;
+                    return None;
+                }
+                2 if s.selected_issue().is_none()
+                    && s.preparing.is_none()
+                    && s.selected_frame.is_some_and(|frame| frame.near(s.area)) =>
+                {
+                    self.verify_app_pointer_routes(
+                        &u.window,
+                        s.backdrop.as_ref().unwrap().0,
+                        s.selected_frame.unwrap(),
+                    );
+                    assert!(u.recovery.isHidden());
+                    println!(
+                        "Polish: selected minimize kept workspace usable; opaque Restore surface, pointer routing, actual Restore button, and picker actions passed"
+                    );
+                    u.client.switch(first);
+                    u.fixture.polish_stage = 3;
+                    return None;
+                }
+                5 if s.selected == Some(second)
+                    && s.preparing.is_none()
+                    && s.selected_issue().is_none() =>
+                {
+                    assert!(!s.paused);
+                    assert!(
+                        s.issues
+                            .iter()
+                            .any(|(id, issue)| *id == first && *issue == DockIssue::Minimized)
+                    );
+                    let window = u.window.clone();
+                    let mut frame = window.frame();
+                    frame.origin.x += 35.;
+                    frame.size.width += 60.;
+                    u.fixture.polish_stage = 6;
+                    u.fixture.dock_test_tick = count;
+                    drop(b);
+                    window.setFrame_display(frame, true);
+                    return None;
+                }
+                6 if count > u.fixture.dock_test_tick + 10
+                    && s.selected_frame.is_some_and(|frame| frame.near(s.area)) =>
+                {
+                    // AppKit frame changes are not focus requests. Explicitly
+                    // reacquire our disposable child before the pointer assertion.
+                    u.client.send(Command::Raise);
+                    u.fixture.polish_stage = 8;
+                    u.fixture.dock_test_tick = count;
+                    return None;
+                }
+                8 if count > u.fixture.dock_test_tick + 3 && s.preparing.is_none() => {
+                    assert!(!s.paused);
+                    assert!(
+                        s.issues
+                            .iter()
+                            .any(|(id, issue)| *id == first && *issue == DockIssue::Minimized)
+                    );
+                    self.verify_app_pointer_routes(
+                        &u.window,
+                        s.backdrop.as_ref().unwrap().0,
+                        s.selected_frame.unwrap(),
+                    );
+                    println!(
+                        "Polish: healthy tab switched, moved and resized while the inactive tab stayed minimized"
+                    );
+                    u.client.switch(first);
+                    u.fixture.polish_stage = 7;
+                    return None;
+                }
+                7 if s.selected == Some(first) && s.issues.is_empty() && s.preparing.is_none() => {
+                    println!(
+                        "Polish: explicit tab selection restored its window; closing restores original geometry"
+                    );
+                    u.client.send(Command::Quit);
+                    u.fixture.dock_test_stage = 20;
+                    return None;
+                }
+                _ => return None,
+            }
+        }
         if std::env::var_os("APPDOCK_SETTINGS_SMOKE").is_some() {
             if count == 2 {
                 assert!(!u.settings_button.isHidden());

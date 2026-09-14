@@ -17,6 +17,8 @@ use std::{
 pub struct Snapshot {
     pub workspace: Workspace,
     pub selected: Option<TabId>,
+    pub preparing: Option<TabId>,
+    pub issues: Vec<(TabId, DockIssue)>,
     pub live: Vec<(TabId, WindowId)>,
     pub windows: Vec<WindowInfo>,
     pub occupied: Vec<WindowId>,
@@ -35,11 +37,20 @@ pub struct Snapshot {
     pub close_attempt: u64,
     pub restore_pending: usize,
     pub backdrop: Option<(u32, Vec<Rect>)>,
+    pub covered_frames: Vec<Rect>,
     pub selected_frame: Option<Rect>,
     pub editing_ack: u64,
     pub area: Rect,
     pub stacked_windows: Vec<(TabId, u32, i32)>,
     pub badges: std::collections::BTreeMap<TabId, String>,
+}
+impl Snapshot {
+    pub fn selected_issue(&self) -> Option<&DockIssue> {
+        self.issues
+            .iter()
+            .find(|(id, _)| Some(*id) == self.selected)
+            .map(|(_, issue)| issue)
+    }
 }
 pub enum Command {
     Apps(Vec<App>),
@@ -255,6 +266,8 @@ fn client(workspace: Workspace) -> Client {
     let snapshot = Snapshot {
         workspace: workspace.clone(),
         selected: None,
+        preparing: None,
+        issues: vec![],
         live: vec![],
         windows: vec![],
         occupied: vec![],
@@ -273,6 +286,7 @@ fn client(workspace: Workspace) -> Client {
         close_attempt: 0,
         restore_pending: 0,
         backdrop: None,
+        covered_frames: vec![],
         selected_frame: None,
         editing_ack: 0,
         area: workspace.geometry,
@@ -525,26 +539,28 @@ pub fn start(workspace: Workspace) -> Client {
                 Some(Command::Attach(tab, id)) => {
                     dirty = true;
                     match windows.iter().find(|w| w.id == id) {
-                        Some(w) => {
-                            engine
-                                .attach(tab, w)
-                                .and_then(|id| engine.switch(id))
-                                .map(|()| {
-                                    setup_window = engine
-                                        .selected
-                                        .and_then(|id| engine.live.get(&id))
-                                        .filter(|a| a.docked)
-                                        .and_then(|a| {
-                                            engine.backend.window_number(a.window).map(|_| a.window)
-                                        });
-                                })
-                        }
+                        Some(w) => engine
+                            .attach(tab, w)
+                            .and_then(|id| {
+                                publish_preparation(&c, &engine, id);
+                                engine.switch(id)
+                            })
+                            .map(|()| {
+                                setup_window = engine
+                                    .selected
+                                    .and_then(|id| engine.live.get(&id))
+                                    .filter(|a| a.docked)
+                                    .and_then(|a| {
+                                        engine.backend.window_number(a.window).map(|_| a.window)
+                                    });
+                            }),
                         None => Err("Window list changed; refresh the picker.".into()),
                     }
                 }
                 Some(Command::Switch(id, generation))
                     if generation == c.generation.load(Ordering::SeqCst) =>
                 {
+                    publish_preparation(&c, &engine, id);
                     engine.switch_current(id, || generation == c.generation.load(Ordering::SeqCst))
                 }
                 Some(Command::Resize(..)) => {
@@ -581,6 +597,9 @@ pub fn start(workspace: Workspace) -> Client {
                         view.badges.remove(&id);
                         badges.remove(&id);
                         view.live.retain(|(tab, _)| *tab != id);
+                        view.issues.retain(|(tab, _)| *tab != id);
+                        view.preparing = None;
+                        view.covered_frames = cover_frames(&engine);
                         view.restore_pending = engine.released.len();
                         view.status = "Window released; restoring original state…".into();
                     }
@@ -604,8 +623,18 @@ pub fn start(workspace: Workspace) -> Client {
                 }
                 Some(Command::Raise) => {
                     if engine.paused.is_none() {
-                        if let Some(a) = engine.selected.and_then(|id| engine.live.get(&id)) {
-                            engine.backend.focus(a.window)
+                        if let Some(a) = engine
+                            .selected
+                            .and_then(|id| engine.live.get(&id))
+                            .filter(|a| a.issue.is_none())
+                        {
+                            engine.backend.state(a.window).and_then(|state| {
+                                if state.minimized || state.modal || state.fullscreen {
+                                    Ok(())
+                                } else {
+                                    engine.backend.focus(a.window)
+                                }
+                            })
                         } else {
                             Ok(())
                         }
@@ -638,7 +667,7 @@ pub fn start(workspace: Workspace) -> Client {
                 if e.kind != ErrorKind::Cancelled {
                     status = e.to_string();
                 }
-            } else if dirty {
+            } else if dirty || completing_switch.is_some() {
                 status = "Ready".into();
             }
             if discovery_complete
@@ -713,6 +742,8 @@ pub fn start(workspace: Workspace) -> Client {
             *c.snapshot.lock().unwrap() = Snapshot {
                 workspace: engine.workspace.clone(),
                 selected: engine.selected,
+                preparing: None,
+                issues: tab_issues(&engine),
                 live: engine.live.iter().map(|(id, a)| (*id, a.window)).collect(),
                 windows: windows.clone(),
                 occupied: windows
@@ -771,10 +802,13 @@ pub fn start(workspace: Workspace) -> Client {
                 selected_frame: engine
                     .selected
                     .and_then(|id| engine.live.get(&id))
+                    .filter(|a| a.issue.is_none())
                     .map(|a| a.expected.frame),
+                covered_frames: cover_frames(&engine),
                 backdrop: engine
                     .selected
                     .and_then(|id| engine.live.get(&id))
+                    .filter(|a| a.issue.is_none())
                     .and_then(|a| engine.backend.window_number(a.window))
                     .map(|number| {
                         (
@@ -782,7 +816,7 @@ pub fn start(workspace: Workspace) -> Client {
                             engine
                                 .live
                                 .values()
-                                .filter(|a| a.docked)
+                                .filter(|a| a.docked && a.issue.is_none())
                                 .map(|a| a.expected.frame)
                                 .collect(),
                         )
@@ -797,6 +831,37 @@ pub fn start(workspace: Workspace) -> Client {
         }
     });
     client
+}
+
+fn tab_issues<B: WindowBackend>(engine: &Engine<B>) -> Vec<(TabId, DockIssue)> {
+    engine
+        .workspace
+        .tabs
+        .iter()
+        .filter_map(|tab| {
+            engine
+                .live
+                .get(&tab.id)?
+                .issue
+                .clone()
+                .map(|issue| (tab.id, issue))
+        })
+        .collect()
+}
+fn cover_frames<B: WindowBackend>(engine: &Engine<B>) -> Vec<Rect> {
+    engine
+        .live
+        .values()
+        .filter(|a| a.docked && a.issue.is_none())
+        .map(|a| a.expected.frame)
+        .collect()
+}
+fn publish_preparation<B: WindowBackend>(client: &Client, engine: &Engine<B>, id: TabId) {
+    let mut view = client.snapshot.lock().unwrap();
+    view.workspace = engine.workspace.clone();
+    view.live = engine.live.iter().map(|(id, a)| (*id, a.window)).collect();
+    view.issues = tab_issues(engine);
+    view.preparing = Some(id);
 }
 
 /// Completion is persisted only after fresh readback of the tested window.
