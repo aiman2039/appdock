@@ -219,6 +219,7 @@ struct RenameEditor {
 struct Ivars {
     ui: RefCell<Option<Ui>>,
     ticks: Cell<u64>,
+    window_closed: Cell<bool>,
     // Window activation can synchronously reenter from an AppKit call.
     order_requested: Cell<bool>,
     dragging: Cell<bool>,
@@ -309,6 +310,10 @@ define_class!(
     unsafe impl NSObjectProtocol for Delegate {}
     unsafe impl NSApplicationDelegate for Delegate {
         #[unsafe(method(applicationDidFinishLaunching:))] fn launched(&self,_:&NSNotification){self.setup();}
+        #[unsafe(method(applicationShouldTerminateAfterLastWindowClosed:))]
+        fn terminate_after_close(&self,_:&NSApplication)->bool { false }
+        #[unsafe(method(applicationShouldHandleReopen:hasVisibleWindows:))]
+        fn reopen(&self,_:&NSApplication,_:bool)->bool { self.reopen_window(); false }
         #[unsafe(method(applicationShouldTerminate:))] fn should_terminate(&self,_:&NSApplication)->NSApplicationTerminateReply {
             if self.ivars().ui.borrow().as_ref().is_none_or(|u|u.client.snapshot.lock().unwrap().stopped) { NSApplicationTerminateReply::TerminateNow } else { self.close_request();NSApplicationTerminateReply::TerminateCancel }
         }
@@ -326,7 +331,7 @@ define_class!(
                 .filter(|_|client.is_some_and(|c|Some(std::ptr::NonNull::from(c))==self.ivars().rename_field.get()))
                 .map(|editor|unsafe { Retained::cast_unchecked(editor.clone()) })
         }
-        #[unsafe(method(windowShouldClose:))] fn close(&self,sender:&NSWindow)->bool {if self.ivars().ui.borrow().as_ref().is_some_and(|u|std::ptr::eq(&*u.window,sender)){self.close_request();false}else{true}}
+        #[unsafe(method(windowShouldClose:))] fn close(&self,sender:&NSWindow)->bool {if self.ivars().ui.borrow().as_ref().is_some_and(|u|std::ptr::eq(&*u.window,sender)){self.hide_window();false}else{true}}
         #[unsafe(method(windowWillMove:))] fn will_move(&self,_:&NSNotification){self.start_tracking();}
         #[unsafe(method(windowDidMove:))] fn moved(&self,_:&NSNotification){self.geometry();}
         #[unsafe(method(windowDidResize:))] fn resized(&self,_:&NSNotification){self.geometry();}
@@ -1737,7 +1742,8 @@ impl Delegate {
         // input. Transparent drawing is not a window-level click-through contract.
         // Match the cached exact window number, not
         // merely its app: unrelated windows from the same process stay independent.
-        if !s.paused
+        if !self.ivars().window_closed.get()
+            && !s.paused
             && selected_issue.is_none()
             && !s.quitting
             && !u.picker_open
@@ -2300,6 +2306,35 @@ impl Delegate {
                 alert.setInformativeText(&NSString::from_str(error));
                 alert.runModal();
             }
+        }
+    }
+    fn hide_window(&self) {
+        self.hide_setup();
+        self.dismiss_picker(false);
+        self.finish_rename(true);
+        self.ivars().window_closed.set(true);
+        let surfaces = {
+            let mut b = self.ivars().ui.borrow_mut();
+            b.as_mut().map(|u| {
+                u.pending_settings = false;
+                u.editing_focus_pending = None;
+                u.client.set_text_editing(false);
+                (u.window.clone(), u.backdrop.clone())
+            })
+        };
+        // Ordering windows can synchronously reenter the delegate.
+        if let Some((window, backdrop)) = surfaces {
+            backdrop.hide();
+            window.orderOut(None);
+        }
+    }
+    fn reopen_window(&self) {
+        self.ivars().window_closed.set(false);
+        let window = self.ivars().ui.borrow().as_ref().map(|u| u.window.clone());
+        if let Some(window) = window {
+            window.deminiaturize(None);
+            window.makeKeyAndOrderFront(None);
+            self.ivars().order_requested.set(true);
         }
     }
     fn close_request(&self) {
