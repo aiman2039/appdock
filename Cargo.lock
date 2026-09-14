@@ -6,6 +6,7 @@ version = 4
 name = "appdock"
 version = "0.3.0"
 dependencies = [
+ "cargo-husky",
  "global-hotkey",
  "objc2",
  "objc2-app-kit",
@@ -35,6 +36,12 @@ checksum = "cdeb9d870516001442e364c5220d3574d2da8dc765554b4a617230d33fa58ef5"
 dependencies = [
  "objc2",
 ]
+
+[[package]]
+name = "cargo-husky"
+version = "1.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7b02b629252fe8ef6460461409564e2c21d0c8e77e0944f3d189ff06c4e932ad"
 
 [[package]]
 name = "crossbeam-channel"

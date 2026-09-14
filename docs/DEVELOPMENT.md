@@ -23,7 +23,7 @@ The `Release` workflow builds native macOS Apple Silicon (`arm64`) and Intel (`x
 
 Set and commit the app version in `Cargo.toml`, then use **Actions → Release → Run workflow** and select the desired branch or revision. There is **no version/tag input**. The workflow derives `vVERSION` from the checked-out manifest, creates that tag if needed, and builds both architectures from the same immutable commit. An existing tag pointing to a different commit is rejected; bump the Cargo version before releasing new code under a new tag.
 
-The release workflow is **manual-only**: pushes and release-publication events do not start it. Rust caches are reused across manual runs on the selected branch and separate architecture, toolchain, compiler environment, and dependency state. The normal push/PR checks workflow also caches both installed Rust toolchains. Repeated runs of the same release replace its named assets while preserving release notes.
+The release workflow is **manual-only**: pushes and release-publication events do not start it. Rust caches are reused across manual runs on the selected branch and separate architecture, toolchain, compiler environment, and dependency state. Checks on `master` and pull requests use Rust 1.95.0 on Apple Silicon and Intel, plus stable Rust on Apple Silicon. The pinned jobs share their cache configuration with releases; `master` builds also warm release-profile dependencies. Repeated runs of the same release replace its named assets while preserving release notes.
 
 The app bundles use ad-hoc signing, as local packages do; they are not Developer ID signed or notarized, so macOS may block downloaded builds pending user approval. Hosted tests do not validate Accessibility permission or live desktop interactions. macOS 12 is the declared deployment minimum; release CI runs on macOS 15 and does not prove compatibility with every older version.
 
@@ -71,6 +71,10 @@ Edit these JSON keys while AppDock is closed to configure shortcuts:
 `Super` is Command on macOS. Shortcuts register only while AppDock or a managed application is foreground. Foreground eligibility is checked every 150 ms; registration conflicts are shown in the status line.
 
 ## Verify
+
+Run `cargo test --locked` once after cloning to install the cargo-husky pre-commit hook. The hook runs `./scripts/check.sh`: formatting, compiler checks, Clippy with warnings denied, tests, and a build. Install the toolchain components with `rustup component add rustfmt clippy` if needed. Checks inspect the current working tree, including unstaged edits.
+
+The same script runs in GitHub Actions on every push to `master`, on pull requests, and before release packaging. CI skips hook installation. Run it manually with `./scripts/check.sh`, or use `RUSTUP_TOOLCHAIN=1.95.0 ./scripts/check.sh` to match the pinned release toolchain.
 
 ```sh
 cargo fmt --all --check

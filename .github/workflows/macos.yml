@@ -1,35 +1,52 @@
 name: macOS checks
 on:
   push:
+    branches: [master]
   pull_request:
+concurrency:
+  group: macos-checks-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 permissions:
   contents: read
 env:
   CARGO_INCREMENTAL: '0'
-  RUSTUP_TOOLCHAIN: stable
+  CARGO_HUSKY_DONT_INSTALL_HOOKS: 'true'
+  MACOSX_DEPLOYMENT_TARGET: '12.0'
 jobs:
   deterministic:
-    runs-on: macos-15
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            toolchain: '1.95.0'
+          - runner: macos-15-intel
+            toolchain: '1.95.0'
+          - runner: macos-15
+            toolchain: stable
+    env:
+      RUSTUP_TOOLCHAIN: ${{ matrix.toolchain }}
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - name: Test release revision handling
         run: python3 scripts/test-release-revision.py
-      - name: Install Rust toolchains
-        run: |
-          rustup toolchain install stable --profile minimal --component rustfmt --component clippy
-          rustup toolchain install 1.95.0 --profile minimal
+      - name: Install Rust
+        run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --component rustfmt --component clippy
       - name: Cache Rust dependencies and build artifacts
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: checks-${{ runner.os }}-${{ runner.arch }}
+          # Match release jobs; the action also hashes toolchains and build settings.
+          shared-key: macos-${{ matrix.runner }}
           cache-bin: false
           env-vars: CARGO CC CFLAGS CXX CMAKE RUST MACOSX_DEPLOYMENT_TARGET SDKROOT
-      - run: cargo +stable fmt --check
-      - run: cargo +stable test --all-features --locked
-      - run: cargo +stable clippy --all-targets --all-features --locked -- -D warnings
-      - run: cargo +stable build --all-features --locked
+      - name: Format, check, Clippy, test, and build
+        run: ./scripts/check.sh
       - name: Check declared minimum Rust version
+        if: matrix.toolchain == '1.95.0'
         run: |
           python3 -c 'import tomllib; assert tomllib.load(open("Cargo.toml", "rb"))["package"]["rust-version"] == "1.95"'
-          cargo +1.95.0 check --all-targets --all-features --locked
+      - name: Warm release build dependencies
+        if: github.event_name == 'push' && matrix.toolchain == '1.95.0'
+        run: cargo build --release --locked

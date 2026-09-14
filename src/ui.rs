@@ -331,7 +331,7 @@ define_class!(
                 else if command==sel!(moveDown:) || command==sel!(moveUp:){
                     if let Some(u)=self.ivars().ui.borrow_mut().as_mut(){u.picker.move_selection(if command==sel!(moveDown:){1}else{-1});}true
                 } else {false}
-            } else if !self.ivars().ui.borrow().as_ref().is_some_and(|u|u.rename_editor.is_some()){false}
+            } else if self.ivars().ui.borrow().as_ref().is_none_or(|u|u.rename_editor.is_none()){false}
             else if command==sel!(cancelOperation:){self.finish_rename(false);true}else if command==sel!(insertNewline:){self.finish_rename(true);true}else{false}
         }
         #[unsafe(method(controlTextDidChange:))] fn text_changed(&self,_:&NSNotification){self.filter();}

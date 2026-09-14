@@ -12,6 +12,7 @@ concurrency:
 
 env:
   CARGO_INCREMENTAL: '0'
+  CARGO_HUSKY_DONT_INSTALL_HOOKS: 'true'
   RUSTUP_TOOLCHAIN: '1.95.0'
   MACOSX_DEPLOYMENT_TARGET: '12.0'
 
@@ -68,7 +69,7 @@ jobs:
       - name: Cache Rust dependencies and build artifacts
         uses: Swatinem/rust-cache@v2
         with:
-          shared-key: release-${{ matrix.runner }}-${{ matrix.target }}
+          shared-key: macos-${{ matrix.runner }}
           cache-bin: false
           env-vars: CARGO CC CFLAGS CXX CMAKE RUST MACOSX_DEPLOYMENT_TARGET SDKROOT
       - name: Verify native target
@@ -77,10 +78,7 @@ jobs:
         run: |
           test "$(rustc -vV | sed -n 's/^host: //p')" = "$EXPECTED_TARGET"
       - name: Check and test
-        run: |
-          cargo fmt --all --check
-          cargo test --all-features --locked
-          cargo clippy --all-targets --all-features --locked -- -D warnings
+        run: ./scripts/check.sh
       - name: Package release app
         run: scripts/package.sh
       - name: Sign and notarize macOS app

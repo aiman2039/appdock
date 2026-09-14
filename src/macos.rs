@@ -250,9 +250,9 @@ pub fn read_dock_badges(
             .optional_attr(&element, "AXURL")?
             .and_then(|v| v.downcast::<CFURL>().ok())
         {
-            if !url
+            if url
                 .scheme()
-                .is_some_and(|scheme| scheme.to_string() == "file")
+                .is_none_or(|scheme| scheme.to_string() != "file")
             {
                 continue;
             }
