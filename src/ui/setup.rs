@@ -346,15 +346,15 @@ impl Delegate {
             let (title, detail, result, primary, secondary, enabled) = match setup.step {
                 Step::Install => (
                     "Install AppDock",
-                    "Drag AppDock.app onto Applications in the installer window. Then eject the installer and open AppDock from Applications.\n\nAlready downloaded a ZIP? Move its AppDock.app into Applications first.",
+                    "Drag AppDock.app onto Applications in the installer window.\nThen eject the installer and open AppDock from Applications.\nAlready downloaded a ZIP? Move its AppDock.app into Applications first.",
                     format!(
                         "{}\nRunning copy (v{}):\n{path}",
                         if installed {
                             "Applications location verified."
                         } else if installer_copy {
-                            "You opened the installer copy. Install and reopen from Applications before granting access."
+                            "You opened the installer copy.\nInstall and reopen from Applications before granting access."
                         } else {
-                            "This copy is outside Applications. Installing there is recommended."
+                            "This copy is outside Applications.\nInstalling there is recommended."
                         },
                         env!("CARGO_PKG_VERSION")
                     ),
@@ -368,11 +368,11 @@ impl Delegate {
                 ),
                 Step::Permission => (
                     "Allow window control",
-                    "Open Accessibility settings and enable AppDock. This lets it move, resize and focus the windows you choose.\n\nIf AppDock is already enabled but this check fails: remove its old entry, add this running copy with +, then quit and reopen AppDock. Screen Recording and Input Monitoring are not required.",
+                    "Open Accessibility settings and enable AppDock.\nThis lets it move, resize and focus the windows you choose.\nIf AppDock is already enabled but this check fails: remove its old entry, add this running copy with +, then quit and reopen AppDock.\nScreen Recording and Input Monitoring are not required.",
                     if s.trusted {
                         "Verified: macOS grants this running copy Accessibility access.".into()
                     } else {
-                        "Not verified: macOS has not granted this process access. This check updates automatically when you return.".into()
+                        "Not verified: macOS has not granted this process access.\nThis check updates automatically when you return.".into()
                     },
                     "Continue",
                     "Open Accessibility Settings",
@@ -386,9 +386,9 @@ impl Delegate {
                     } else if s.readiness.generation != setup.generation {
                         "Run the check to verify current access.".into()
                     } else if !s.readiness.desktop_available {
-                        "Cannot read desktop window geometry. Reopen AppDock in your logged-in desktop session and retry.".into()
+                        "Cannot read desktop window geometry.\nReopen AppDock in your logged-in desktop session and retry.".into()
                     } else if s.readiness.eligible_windows == 0 {
-                        "No controllable windows found. Open a normal Finder or TextEdit window on this desktop, leave fullscreen, close dialogs, then retry.".into()
+                        "No controllable windows found.\nOpen a normal Finder or TextEdit window on this desktop, leave fullscreen, close dialogs, then retry.".into()
                     } else {
                         format!(
                             "Verified: {} controllable window(s) and desktop geometry access.\n{}",
@@ -400,7 +400,7 @@ impl Delegate {
                     };
                     (
                         "Check your workspace",
-                        "AppDock checks real window access and the move, resize, minimize and raise capabilities needed for docking.\n\nNo window is changed during this check. Some apps and dialogs do not support these operations.",
+                        "AppDock checks real window access and the move, resize, minimize and raise capabilities needed for docking.\nNo window is changed during this check.\nSome apps and dialogs do not support these operations.",
                         result,
                         "Continue",
                         "Check again",
@@ -411,10 +411,10 @@ impl Delegate {
                 }
                 Step::TryWindow => (
                     "Try your first window",
-                    "Choose a window in Add App. AppDock will dock it and verify its position and focus. The window remains in your workspace.\n\nOnce docked, click inside the app to check interaction. Close its AppDock tab whenever you want to release it; the app keeps running.",
+                    "Choose a window in Add App.\nAppDock will dock it and verify its position and focus.\nThe window remains in your workspace.\nOnce docked, click inside the app to check interaction.\nClose its AppDock tab whenever you want to release it; the app keeps running.",
                     if setup.test_started {
                         format!(
-                            "Waiting for a successful dock. {}\nUse AppDock → Setup & Diagnostics to return here. If an attempt left a failed tab, release it before retrying.",
+                            "Waiting for a successful dock.\n{}\nUse AppDock → Setup & Diagnostics to return here.\nIf an attempt left a failed tab, release it before retrying.",
                             s.status
                         )
                     } else {
@@ -426,11 +426,11 @@ impl Delegate {
                 ),
                 Step::Finish => (
                     "Window control verified",
-                    "AppDock successfully docked your window and checked its frame, focus and desktop window identity.\n\nConfirm that you can click and type in the docked app, then finish setup. You can rerun these checks from AppDock → Setup & Diagnostics.",
+                    "AppDock successfully docked your window and checked its frame, focus and desktop window identity.\nConfirm that you can click and type in the docked app, then finish setup.\nYou can rerun these checks from AppDock → Setup & Diagnostics.",
                     if setup.finishing {
                         format!("Saving setup… {}", s.status)
                     } else if let Some((_, Err(error))) = &s.setup_completion {
-                        format!("Could not save setup: {error}. Try Finish setup again.")
+                        format!("Could not save setup: {error}.\nTry Finish setup again.")
                     } else {
                         u.shortcut_error.clone().unwrap_or_else(|| {
                             "Accessibility and a real docking operation passed.".into()
