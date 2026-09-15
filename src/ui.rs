@@ -222,6 +222,8 @@ struct Ivars {
     window_closed: Cell<bool>,
     // Window activation can synchronously reenter from an AppKit call.
     order_requested: Cell<bool>,
+    reveal_pending: Cell<bool>,
+    reveal_deadline: Cell<Option<std::time::Instant>>,
     dragging: Cell<bool>,
     tracking_samples: Cell<u64>,
     drag_timer: OnceCell<Retained<NSTimer>>,
@@ -282,6 +284,12 @@ struct Ui {
     pending_rename: Option<TabId>,
     order_after: Option<std::time::Instant>,
     last_direct_window: Option<u32>,
+}
+struct ReopenPlan {
+    window: Retained<NSWindow>,
+    client: Client,
+    action: crate::window_tracking::RevealAction,
+    hidden: bool,
 }
 fn sync_selection(u: &mut Ui, s: &worker::Snapshot) {
     u.editing = u
@@ -1641,6 +1649,26 @@ impl Delegate {
         u.surface
             .set_attached(attached && !u.picker_open && !setup_visible && selected_issue.is_none());
         u.hint.setHidden(attached || u.picker_open || setup_visible);
+        let reveal = if self.ivars().reveal_pending.get() {
+            self.workspace_reveal_progress(u, &s)
+        } else {
+            crate::window_tracking::RevealProgress::Idle
+        };
+        if matches!(reveal, crate::window_tracking::RevealProgress::Wait) {
+            self.ivars().order_requested.set(false);
+            u.order_after = None;
+        }
+        if matches!(
+            reveal,
+            crate::window_tracking::RevealProgress::Tuck
+                | crate::window_tracking::RevealProgress::ShowManager
+        ) {
+            let window = u.window.clone();
+            let selected = s.backdrop.as_ref().map(|(number, _)| *number);
+            drop(b);
+            self.apply_workspace_reveal(reveal, window, selected);
+            return;
+        }
         if self.ivars().order_requested.replace(false) {
             u.order_after = Some(std::time::Instant::now() - std::time::Duration::from_millis(251));
         }
@@ -1775,6 +1803,7 @@ impl Delegate {
         // Match the cached exact window number, not
         // merely its app: unrelated windows from the same process stay independent.
         if !self.ivars().window_closed.get()
+            && !self.ivars().reveal_pending.get()
             && !s.paused
             && selected_issue.is_none()
             && !s.quitting
@@ -2363,11 +2392,134 @@ impl Delegate {
     }
     fn reopen_window(&self) {
         self.ivars().window_closed.set(false);
-        let window = self.ivars().ui.borrow().as_ref().map(|u| u.window.clone());
-        if let Some(window) = window {
+        if let Some(plan) = self.workspace_reopen_plan() {
+            self.apply_workspace_reopen(plan);
+        }
+    }
+    fn workspace_reopen_plan(&self) -> Option<ReopenPlan> {
+        let b = self.ivars().ui.borrow();
+        let u = b.as_ref()?;
+        let snapshot = u.client.snapshot.lock().unwrap();
+        let busy = snapshot.paused
+            || snapshot.quitting
+            || u.picker_open
+            || u.pending_picker
+            || u.pending_settings
+            || u.rename_editor.is_some()
+            || u.pending_rename.is_some()
+            || u.setup_wizard.as_ref().is_some_and(|setup| setup.visible());
+        let selected = snapshot.backdrop.as_ref().map(|(number, _)| *number);
+        drop(snapshot);
+        let window = u.window.clone();
+        let client = u.client.clone();
+        let app = NSApplication::sharedApplication(self.mtm());
+        let hidden = !window.isVisible() || window.isMiniaturized() || app.isHidden();
+        let action = if busy {
+            crate::window_tracking::RevealAction::ShowManager
+        } else {
+            crate::window_tracking::reveal_action(
+                &crate::window_tracking::stack().unwrap_or_default(),
+                crate::window_tracking::RevealWindows {
+                    manager: window.windowNumber() as u32,
+                    backdrop: Some(u.backdrop.number()).filter(|number| *number > 0),
+                    selected,
+                },
+            )
+        };
+        Some(ReopenPlan {
+            window,
+            client,
+            action,
+            hidden,
+        })
+    }
+    fn apply_workspace_reopen(&self, plan: ReopenPlan) {
+        let ReopenPlan {
+            window,
+            client,
+            action,
+            hidden,
+        } = plan;
+        if hidden || action != crate::window_tracking::RevealAction::RaiseThenTuck {
+            let app = NSApplication::sharedApplication(self.mtm());
+            if app.isHidden() {
+                app.unhide(None);
+            }
             window.deminiaturize(None);
             window.makeKeyAndOrderFront(None);
-            self.ivars().order_requested.set(true);
+        }
+        match action {
+            crate::window_tracking::RevealAction::RaiseThenTuck => {
+                // Dock activation raises only AppDock. Tucking under a still-buried
+                // selected window hides the workspace; raise that window first.
+                client.send(Command::Raise);
+                self.ivars().reveal_pending.set(true);
+                self.ivars().reveal_deadline.set(Some(
+                    std::time::Instant::now() + std::time::Duration::from_secs(2),
+                ));
+            }
+            crate::window_tracking::RevealAction::Tuck
+            | crate::window_tracking::RevealAction::ShowManager => {
+                self.ivars().reveal_pending.set(false);
+                self.ivars().order_requested.set(true);
+            }
+        }
+    }
+    fn workspace_reveal_progress(
+        &self,
+        u: &Ui,
+        s: &worker::Snapshot,
+    ) -> crate::window_tracking::RevealProgress {
+        let timed_out = self
+            .ivars()
+            .reveal_deadline
+            .get()
+            .is_some_and(|deadline| std::time::Instant::now() >= deadline);
+        let busy = s.paused || s.quitting || s.stopped;
+        let action = if busy {
+            crate::window_tracking::RevealAction::ShowManager
+        } else {
+            crate::window_tracking::reveal_action(
+                &crate::window_tracking::stack().unwrap_or_default(),
+                crate::window_tracking::RevealWindows {
+                    manager: u.window.windowNumber() as u32,
+                    backdrop: Some(u.backdrop.number()).filter(|number| *number > 0),
+                    selected: s.backdrop.as_ref().map(|(number, _)| *number),
+                },
+            )
+        };
+        let progress = crate::window_tracking::reveal_progress(
+            self.ivars().reveal_pending.get(),
+            timed_out,
+            action,
+        );
+        if !matches!(progress, crate::window_tracking::RevealProgress::Wait) {
+            self.ivars().reveal_pending.set(false);
+            self.ivars().reveal_deadline.set(None);
+        }
+        progress
+    }
+    fn apply_workspace_reveal(
+        &self,
+        progress: crate::window_tracking::RevealProgress,
+        window: Retained<NSWindow>,
+        selected: Option<u32>,
+    ) {
+        match progress {
+            crate::window_tracking::RevealProgress::Tuck => {
+                #[allow(deprecated)]
+                NSApplication::sharedApplication(self.mtm()).activateIgnoringOtherApps(true);
+                window.makeKeyAndOrderFront(None);
+                if let Some(number) = selected {
+                    window.orderWindow_relativeTo(NSWindowOrderingMode::Below, number as isize);
+                }
+                self.ivars().order_requested.set(true);
+            }
+            crate::window_tracking::RevealProgress::ShowManager => {
+                window.makeKeyAndOrderFront(None);
+            }
+            crate::window_tracking::RevealProgress::Idle
+            | crate::window_tracking::RevealProgress::Wait => {}
         }
     }
     fn close_request(&self) {
