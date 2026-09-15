@@ -264,6 +264,7 @@ struct Ui {
     status: Retained<NSTextField>,
     permission_button: Retained<NSButton>,
     replace_button: Retained<NSButton>,
+    resume_button: Retained<NSButton>,
     rename_editor: Option<RenameEditor>,
     picker: crate::picker::InlinePicker,
     picker_open: bool,
@@ -452,6 +453,7 @@ define_class!(
             }
         }
         #[unsafe(method(retryRestoration:))] fn retry_restoration(&self,_:&AnyObject){if let Some(u)=self.ivars().ui.borrow().as_ref(){u.client.send(Command::RetryRestoration);}}
+        #[unsafe(method(resumeDocking:))] fn resume_docking(&self,_:&AnyObject){if let Some(u)=self.ivars().ui.borrow().as_ref(){u.client.send(Command::Resume);}}
         #[unsafe(method(quitApp:))] fn quit(&self,_:&AnyObject){self.close_request();}
     }
 );
@@ -693,9 +695,14 @@ impl Delegate {
         let replace_button = self.button(
             "Replace window…",
             sel!(replaceWindow:),
-            rect(w - 242., h - 62., 144., 26.),
+            rect(w - 256., h - 62., 144., 26.),
         );
-        for button in [&permission_button, &replace_button] {
+        let resume_button = self.button(
+            "Resume",
+            sel!(resumeDocking:),
+            rect(w - 108., h - 62., 96., 26.),
+        );
+        for button in [&permission_button, &replace_button, &resume_button] {
             button.setHidden(true);
             button.setAutoresizingMask(
                 NSAutoresizingMaskOptions::ViewMinXMargin
@@ -707,7 +714,7 @@ impl Delegate {
             &NSString::from_str("Checking Accessibility permission…"),
             m,
         );
-        status.setFrame(rect(12., h - 59., w - 266., 20.));
+        status.setFrame(rect(12., h - 59., w - 280., 20.));
         status.setFont(Some(&theme::font(12.)));
         status.setTextColor(Some(&theme::color(theme::SECONDARY)));
         status.setAutoresizingMask(
@@ -805,6 +812,7 @@ impl Delegate {
             status,
             permission_button,
             replace_button,
+            resume_button,
             refresh_started: std::time::Instant::now(),
             refresh: crate::schedule::RefreshSchedule::default(),
             rename_editor: None,
@@ -967,7 +975,19 @@ impl Delegate {
         submenu.addItem(&logs_item);
         submenu.addItem(&settings_item);
         submenu.addItem(&startup_item);
+        let resume = unsafe {
+            NSMenuItem::initWithTitle_action_keyEquivalent(
+                NSMenuItem::alloc(m),
+                &NSString::from_str("Resume Docking"),
+                Some(sel!(resumeDocking:)),
+                &NSString::from_str(""),
+            )
+        };
+        unsafe {
+            resume.setTarget(Some(self));
+        }
         submenu.addItem(&NSMenuItem::separatorItem(m));
+        submenu.addItem(&resume);
         submenu.addItem(&retry);
         submenu.addItem(&quit);
         root.setSubmenu(Some(&submenu));
@@ -1747,6 +1767,8 @@ impl Delegate {
             .is_some_and(|id| !s.live.iter().any(|(t, _)| *t == id));
         u.replace_button
             .setHidden(setup_visible || !s.trusted || !disconnected);
+        u.resume_button
+            .setHidden(setup_visible || !s.trusted || !s.paused);
         let text = if setup_visible {
             String::new()
         } else if !s.trusted {

@@ -268,6 +268,14 @@ impl Client {
             .is_some_and(|(tab, _)| tab == id)
     }
 }
+fn recovery_deadline_resets(was_paused: bool, now_paused: bool) -> bool {
+    !now_paused || !was_paused
+}
+
+fn number_allows_recovery(number: Option<u32>, stack_numbers: &[u32]) -> bool {
+    number.is_none_or(|n| stack_numbers.contains(&n))
+}
+
 // Never move windows belonging to another desktop during automatic recovery.
 fn recovery_windows_visible(engine: &Engine<MacBackend>, workspace: u32) -> bool {
     if workspace == 0 {
@@ -276,16 +284,14 @@ fn recovery_windows_visible(engine: &Engine<MacBackend>, workspace: u32) -> bool
     let Some(stack) = crate::window_tracking::stack() else {
         return false;
     };
-    if !stack.iter().any(|w| w.number == workspace) {
+    let numbers: Vec<u32> = stack.iter().map(|window| window.number).collect();
+    if !numbers.contains(&workspace) {
         return false;
     }
     engine.live.values().filter(|a| a.docked).all(|a| {
         engine.backend.state(a.window).is_ok_and(|state| {
             state.minimized
-                || engine
-                    .backend
-                    .window_number(a.window)
-                    .is_some_and(|number| stack.iter().any(|w| w.number == number))
+                || number_allows_recovery(engine.backend.window_number(a.window), &numbers)
         })
     })
 }
@@ -413,7 +419,7 @@ pub fn start(workspace: Workspace) -> Client {
                 save_after = Some(Instant::now() + Duration::from_millis(250));
             }
             let mut stopped = false;
-            let desktop_changed = matches!(command, Some(Command::Pause));
+            let was_paused = engine.paused.is_some();
             let result: Result<()> = match command {
                 Some(
                     Command::Attach(..)
@@ -753,7 +759,7 @@ pub fn start(workspace: Workspace) -> Client {
                 }
                 dirty = true;
             }
-            if engine.paused.is_none() || desktop_changed {
+            if recovery_deadline_resets(was_paused, engine.paused.is_some()) {
                 next_recovery = Instant::now() + Duration::from_secs(2);
             } else if Instant::now() >= next_recovery {
                 next_recovery = Instant::now() + Duration::from_secs(2);
@@ -986,6 +992,19 @@ fn apply_geometry<B: WindowBackend>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn recovery_timer_resets_only_when_entering_or_leaving_pause() {
+        assert!(recovery_deadline_resets(false, false));
+        assert!(recovery_deadline_resets(false, true));
+        assert!(!recovery_deadline_resets(true, true));
+        assert!(recovery_deadline_resets(true, false));
+    }
+    #[test]
+    fn unknown_window_number_does_not_block_recovery() {
+        assert!(number_allows_recovery(None, &[1, 2]));
+        assert!(number_allows_recovery(Some(2), &[1, 2]));
+        assert!(!number_allows_recovery(Some(9), &[1, 2]));
+    }
     #[test]
     fn setup_completion_requires_live_readback_and_a_successful_save() {
         let root =

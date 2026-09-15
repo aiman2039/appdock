@@ -19,6 +19,8 @@ pub struct Engine<B: WindowBackend> {
     pub workspace: Workspace,
     pub live: HashMap<TabId, Attachment>,
     pub released: HashMap<TabId, Attachment>,
+    /// Missing-poll disconnects. Rebind restores docking from this snapshot.
+    pub orphans: HashMap<TabId, Attachment>,
     pub selected: Option<TabId>,
     pub paused: Option<String>,
     pub area: Rect,
@@ -33,6 +35,7 @@ impl<B: WindowBackend> Engine<B> {
             workspace,
             live: HashMap::new(),
             released: HashMap::new(),
+            orphans: HashMap::new(),
             selected: None,
             paused: None,
             area,
@@ -120,6 +123,7 @@ impl<B: WindowBackend> Engine<B> {
             },
         );
         self.backend.watch(window.id, true);
+        self.orphans.remove(&id);
         crate::event_log::emit(
             "attached",
             json!({
@@ -357,6 +361,7 @@ impl<B: WindowBackend> Engine<B> {
                 self.released.insert(id, a);
             }
         }
+        self.orphans.remove(&id);
         self.workspace.tabs.retain(|t| t.id != id);
         if self.selected == Some(id) {
             self.selected = None;
@@ -483,74 +488,94 @@ impl<B: WindowBackend> Engine<B> {
                     self.set_paused(Some("Accessibility permission was revoked".into()));
                 }
                 BackendEvent::Closed(info) => self.drop_closed(info),
-                BackendEvent::Missing(info) => self.note_missing(info),
+                BackendEvent::Missing(info) => self.observe_missing(info),
                 BackendEvent::Changed(w) => {
                     self.reset_missing(w);
-                    if let Some((&id, a)) =
-                        self.live.iter().find(|(_, a)| a.window == w && a.docked)
-                    {
-                        let expected = a.expected;
-                        match self.backend.state(w) {
-                            Ok(state) if state.fullscreen || state.modal => {
-                                self.set_paused(Some(
-                                    "Target entered fullscreen/dialog state".into(),
-                                ));
-                            }
-                            Ok(state) if state.minimized => {
-                                self.live.get_mut(&id).unwrap().issue = Some(DockIssue::Minimized);
-                            }
-                            // Failed readiness needs an explicit retry, not a polling loop.
-                            Ok(_) if matches!(a.issue, Some(DockIssue::Restore(_))) => {}
-                            Ok(_) if a.issue.is_some() => {
-                                // A user may restore through the Dock. Revalidate before
-                                // moving it again, but never steal focus during polling.
-                                if self.paused.is_none() && !self.pointer_down {
-                                    let restored = self
-                                        .backend
-                                        .validate_restored_window(w, &|| true)
-                                        .and_then(|()| self.backend.set_frame(w, self.area));
-                                    let a = self.live.get_mut(&id).unwrap();
-                                    match restored {
-                                        Ok(frame) => {
-                                            a.expected.frame = frame;
-                                            a.expected.minimized = false;
-                                            a.issue = None;
-                                        }
-                                        Err(e) if e.kind == ErrorKind::Cancelled => {}
-                                        Err(e) if e.kind == ErrorKind::Permission => {
-                                            self.set_paused(Some(e.to_string()));
-                                        }
-                                        Err(e) => a.issue = Some(DockIssue::Restore(e.to_string())),
-                                    }
-                                }
-                            }
-                            Ok(state)
-                                if !state.frame.near(expected.frame)
-                                    && self.paused.is_none()
-                                    && !self.pointer_down =>
-                            {
-                                // Movement does not release ownership. Wait until the mouse is
-                                // released, then put the selected window back in the workspace.
-                                let target = if a.docked { self.area } else { expected.frame };
-                                match self.backend.set_frame(w, target) {
-                                    Ok(frame) => {
-                                        self.live.get_mut(&id).unwrap().expected.frame = frame
-                                    }
-                                    Err(e) => self.set_paused(Some(e.to_string())),
-                                }
-                            }
-                            Err(e) if a.issue.is_some() && e.kind != ErrorKind::Permission => {
-                                self.live.get_mut(&id).unwrap().issue =
-                                    Some(DockIssue::Restore(e.to_string()));
-                            }
-                            Err(e) if !self.pointer_down => {
-                                self.set_paused(Some(e.to_string()));
-                            }
-                            _ => {}
-                        }
-                    }
+                    self.observe_changed(w);
                 }
             }
+        }
+    }
+    fn observe_missing(&mut self, info: ClosedInfo) {
+        // Empty AXWindows is not closure. A readable handle is still attached.
+        if self.backend.state(info.window).is_ok() {
+            self.reset_missing(info.window);
+            self.observe_changed(info.window);
+            return;
+        }
+        // Space changes empty AXWindows; dropping handles while paused loses docked.
+        if self.paused.is_some() {
+            return;
+        }
+        self.note_missing(info);
+    }
+    fn observe_changed(&mut self, w: WindowId) {
+        let Some((&id, a)) = self.live.iter().find(|(_, a)| a.window == w && a.docked) else {
+            return;
+        };
+        let expected = a.expected;
+        let issue = a.issue.clone();
+        match self.backend.state(w) {
+            Ok(state) if state.fullscreen || state.modal => {
+                self.set_paused(Some("Target entered fullscreen/dialog state".into()));
+            }
+            Ok(state) if state.minimized => {
+                if let Some(attachment) = self.live.get_mut(&id) {
+                    attachment.issue = Some(DockIssue::Minimized);
+                }
+            }
+            Ok(_) if matches!(issue, Some(DockIssue::Restore(_))) => {}
+            Ok(_) if issue.is_some() => self.redock_externally_restored(id, w),
+            Ok(state) if !state.frame.near(expected.frame) => self.yank_drifted(w, id),
+            Err(e) if issue.is_some() && e.kind != ErrorKind::Permission => {
+                if let Some(attachment) = self.live.get_mut(&id) {
+                    attachment.issue = Some(DockIssue::Restore(e.to_string()));
+                }
+            }
+            Err(e) if !self.pointer_down => {
+                self.set_paused(Some(e.to_string()));
+            }
+            _ => {}
+        }
+    }
+    fn redock_externally_restored(&mut self, id: TabId, w: WindowId) {
+        if self.paused.is_some() || self.pointer_down {
+            return;
+        }
+        let restored = self
+            .backend
+            .validate_restored_window(w, &|| true)
+            .and_then(|()| self.backend.set_frame(w, self.area));
+        match restored {
+            Ok(frame) => {
+                if let Some(attachment) = self.live.get_mut(&id) {
+                    attachment.expected.frame = frame;
+                    attachment.expected.minimized = false;
+                    attachment.issue = None;
+                }
+            }
+            Err(e) if e.kind == ErrorKind::Cancelled => {}
+            Err(e) if e.kind == ErrorKind::Permission => {
+                self.set_paused(Some(e.to_string()));
+            }
+            Err(e) => {
+                if let Some(attachment) = self.live.get_mut(&id) {
+                    attachment.issue = Some(DockIssue::Restore(e.to_string()));
+                }
+            }
+        }
+    }
+    fn yank_drifted(&mut self, w: WindowId, id: TabId) {
+        if self.paused.is_some() || self.pointer_down {
+            return;
+        }
+        match self.backend.set_frame(w, self.area) {
+            Ok(frame) => {
+                if let Some(attachment) = self.live.get_mut(&id) {
+                    attachment.expected.frame = frame;
+                }
+            }
+            Err(e) => self.set_paused(Some(e.to_string())),
         }
     }
     pub fn rebind_disconnected(&mut self, windows: &[WindowInfo]) -> bool {
@@ -582,8 +607,21 @@ impl<B: WindowBackend> Engine<B> {
             return false;
         };
         let selected = self.selected == Some(tab.id);
+        let orphan = self.orphans.remove(&tab.id);
         if self.attach(Some(tab.id), window).is_err() {
+            if let Some(orphan) = orphan {
+                self.orphans.insert(tab.id, orphan);
+            }
             return false;
+        }
+        if let Some(previous) = orphan
+            && let Some(attachment) = self.live.get_mut(&tab.id)
+        {
+            attachment.original = previous.original;
+            attachment.expected = previous.expected;
+            attachment.docked = previous.docked;
+            attachment.issue = previous.issue;
+            attachment.deferred_startup = previous.deferred_startup;
         }
         crate::event_log::emit(
             "rebound",
@@ -593,7 +631,7 @@ impl<B: WindowBackend> Engine<B> {
                 "bundle": tab.identity.bundle,
             }),
         );
-        if selected {
+        if selected && self.paused.is_none() {
             let _ = self.switch(tab.id);
         }
         true
@@ -628,6 +666,7 @@ impl<B: WindowBackend> Engine<B> {
                 .map(|tab| tab.identity.bundle.clone());
             crate::event_log::window_closed(&info, Some(id), bundle.as_deref());
             self.live.remove(&id);
+            self.orphans.remove(&id);
             self.workspace.tabs.retain(|t| t.id != id);
             self.backend.watch(w, false);
             if self.selected == Some(id) {
@@ -684,6 +723,7 @@ impl<B: WindowBackend> Engine<B> {
         );
         if let Some(attachment) = self.live.remove(&id) {
             self.backend.watch(attachment.window, false);
+            self.orphans.insert(id, attachment);
         }
     }
     pub fn resume(&mut self) -> Result<()> {
@@ -1072,10 +1112,14 @@ pub(crate) mod tests {
             ..ClosedInfo::default()
         })
     }
+    fn hide_state(e: &mut Engine<Fake>, id: WindowId) -> WindowState {
+        e.backend.states.remove(&id).unwrap()
+    }
     #[test]
     fn missing_handle_does_not_pause_or_drop_before_threshold() {
         let mut e = fixture();
         e.switch(1).unwrap();
+        hide_state(&mut e, 1);
         e.backend.events.push(missing_event(1));
         e.observe();
         assert!(e.paused.is_none());
@@ -1090,12 +1134,14 @@ pub(crate) mod tests {
     fn missing_handle_disconnects_tab_after_threshold_without_deleting_it() {
         let mut e = fixture();
         e.switch(1).unwrap();
+        hide_state(&mut e, 1);
         for _ in 0..3 {
             e.backend.events.push(missing_event(1));
             e.observe();
         }
         assert!(e.paused.is_none());
         assert!(!e.live.contains_key(&1));
+        assert!(e.orphans.contains_key(&1));
         assert!(e.workspace.tabs.iter().any(|tab| tab.id == 1));
         assert_eq!(e.selected, Some(1));
     }
@@ -1103,17 +1149,136 @@ pub(crate) mod tests {
     fn present_handle_resets_missing_polls() {
         let mut e = fixture();
         e.switch(1).unwrap();
+        let state = hide_state(&mut e, 1);
         e.backend.events.push(missing_event(1));
         e.backend.events.push(missing_event(1));
         e.observe();
         assert_eq!(e.live[&1].missing_polls, 2);
+        e.backend.states.insert(1, state);
         e.backend.events.push(BackendEvent::Changed(1));
         e.observe();
         assert_eq!(e.live[&1].missing_polls, 0);
+        hide_state(&mut e, 1);
         e.backend.events.push(missing_event(1));
         e.observe();
         assert!(e.live.contains_key(&1));
         assert_eq!(e.live[&1].missing_polls, 1);
+    }
+    #[test]
+    fn empty_window_list_keeps_readable_handle() {
+        let mut e = fixture();
+        e.switch(1).unwrap();
+        for _ in 0..10 {
+            e.backend.events.push(missing_event(1));
+            e.observe();
+        }
+        assert!(e.live.contains_key(&1));
+        assert!(e.live[&1].docked);
+        assert_eq!(e.live[&1].missing_polls, 0);
+        assert!(e.orphans.is_empty());
+    }
+    #[test]
+    fn empty_window_list_still_yanks_a_readable_docked_window() {
+        let mut e = fixture();
+        e.switch(1).unwrap();
+        e.backend.states.get_mut(&1).unwrap().frame.x += 300.;
+        e.backend.events.push(missing_event(1));
+        e.observe();
+        assert!(e.live[&1].docked);
+        assert_eq!(e.backend.states[&1].frame, e.area);
+    }
+    #[test]
+    fn pause_freezes_missing_disconnect_even_when_state_fails() {
+        let mut e = fixture();
+        e.switch(1).unwrap();
+        e.pause_for("Desktop changed");
+        hide_state(&mut e, 1);
+        for _ in 0..10 {
+            e.backend.events.push(missing_event(1));
+            e.observe();
+        }
+        assert!(e.live.contains_key(&1));
+        assert!(e.live[&1].docked);
+        assert_eq!(e.live[&1].missing_polls, 0);
+    }
+    #[test]
+    fn pause_and_empty_list_keep_docked_until_resume_moves() {
+        let mut e = fixture();
+        e.switch(1).unwrap();
+        let original = e.live[&1].original;
+        e.pause_for("Desktop changed");
+        e.backend.states.get_mut(&1).unwrap().frame.x += 300.;
+        let drifted = e.backend.states[&1].frame;
+        for _ in 0..10 {
+            e.backend.events.push(missing_event(1));
+            e.observe();
+        }
+        assert!(e.live[&1].docked);
+        assert_eq!(e.live[&1].original, original);
+        assert_eq!(e.backend.states[&1].frame, drifted);
+        e.area.x = 400.;
+        e.resume().unwrap();
+        assert!(e.paused.is_none());
+        assert_eq!(e.backend.states[&1].frame, e.area);
+        assert_eq!(e.live[&1].original, original);
+    }
+    #[test]
+    fn rebind_restores_docked_and_original_snapshot() {
+        let mut e = fixture();
+        e.switch(1).unwrap();
+        let original = e.live[&1].original;
+        hide_state(&mut e, 1);
+        for _ in 0..3 {
+            e.backend.events.push(missing_event(1));
+            e.observe();
+        }
+        assert!(!e.live.contains_key(&1));
+        e.backend.states.insert(
+            1,
+            WindowState {
+                frame: Rect {
+                    x: 777.,
+                    ..Rect::default()
+                },
+                ..original
+            },
+        );
+        assert!(e.rebind_disconnected(&[sample_window(1, "same")]));
+        assert!(e.live[&1].docked);
+        assert_eq!(e.live[&1].original, original);
+        assert_eq!(e.backend.states[&1].frame, e.area);
+    }
+    #[test]
+    fn paused_rebind_keeps_docked_without_focus_then_resume_moves() {
+        let mut e = fixture();
+        e.switch(1).unwrap();
+        let original = e.live[&1].original;
+        e.backend.focused = None;
+        hide_state(&mut e, 1);
+        for _ in 0..3 {
+            e.backend.events.push(missing_event(1));
+            e.observe();
+        }
+        e.pause_for("Desktop changed");
+        e.backend.states.insert(
+            1,
+            WindowState {
+                frame: Rect {
+                    x: 777.,
+                    ..Rect::default()
+                },
+                ..original
+            },
+        );
+        assert!(e.rebind_disconnected(&[sample_window(1, "same")]));
+        assert!(e.live[&1].docked);
+        assert_eq!(e.live[&1].original, original);
+        assert_eq!(e.backend.states[&1].frame.x, 777.);
+        assert!(e.backend.focused.is_none());
+        e.resume_in_background().unwrap();
+        assert!(e.paused.is_none());
+        assert_eq!(e.backend.states[&1].frame, e.area);
+        assert!(e.backend.focused.is_none());
     }
     fn sample_window(id: WindowId, bundle: &str) -> WindowInfo {
         WindowInfo {
