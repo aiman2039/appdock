@@ -1,39 +1,23 @@
-# Plan: Dock click reveals workspace
+# Plan: keep docked windows across Space/AX empty-list
 
-SPEC Alignment: aligned — ARCHITECTURE.md stack is selected > AppDock > backdrop > inactive. Dock reopen never raises the selected foreign window, then tucks AppDock under it while it is still buried. No SPEC.md; product behavior from ARCHITECTURE.md + DEVELOPMENT.md.
+SPEC Alignment: aligned — Space change pauses docking; empty AXWindows is not closure. Dropping handles on Missing then rebind `docked=false` made Resume a no-op.
 
-Covering window in front → Dock click → AppDock `makeKeyAndOrderFront` (flicker) → tick `orderWindow(Below, selected)` while selected still behind cover → workspace stays hidden.
+Space change → Pause → AXWindows=[] → 3 Missing polls dropped handles → rebind attach() docked=false → Resume moved nothing.
 
 ```
-Dock click
-  → applicationShouldHandleReopen
-  → selected on-screen and buried?
-       yes → Command::Raise, defer tuck until selected front (only our windows above it)
-       no  → deminiaturize + makeKeyAndOrderFront (today)
-  → selected front → order AppDock below selected; AppDock stays key
-Title-bar / become-key: unchanged (immediate tuck, no AXRaise)
+Missing event
+  → state() ok? keep handle, treat as Changed
+  → paused? keep handle (do not count Missing)
+  → else 3 misses → orphan snapshot, disconnect tab (keep saved tab)
+Rebind → restore docked + original from orphan
+Pause while already paused → do not reset 2s auto-resume timer
+None window_number → do not block recovery
+UI: Resume button + menu when paused
 ```
 
-- [x] Task 1: `window_tracking` reveal predicate + unit tests
-  - Input: front-to-back stack, manager#, backdrop#, selected#
-  - Buried = unrelated window above selected (ignore our two windows)
-  - Cases: buried, already front+tucked, selected missing, empty
-- [x] Task 2: Dock reopen uses predicate
-  - `reopen_window`: hidden/miniaturized still shows AppDock
-  - Buried: `Command::Raise`; do **not** immediate `order_requested` tuck
-  - Tick: tuck only after selected is front; timeout fallback shows AppDock
-  - Title-bar path unchanged
-  - AppDock remains key after tuck (menus); app body stays clickable
-- [x] Task 3: Regression
-  - Unit tests in Task 1 are the CI proof
-  - Native: covering window + Dock-equivalent `reopen_window`; selected+chrome in front of cover
-  - `scripts/check.sh`
+- [x] Task 1: Engine Missing/rebind — keep handle if state() ok or paused; orphan snapshot; rebind restores docked+original; tests
+- [x] Task 2: Auto-resume — don't reset 2s timer on redundant Pause; None window_number does not block; tests
+- [x] Task 3: Resume button in status row when paused
 
-Out of scope: Cmd+Tab/`DidBecomeActive`; raising inactive tabs; window levels; previous uncommitted Space/AX work.
-
+Out of scope: AXObserver.
 Stay here.
-
-## Unresolved
-
-- Cmd+Tab when buried: same bug? (recommend follow-up)
-- After Dock click, should keyboard stay on AppDock (recommended) or move to docked app?
