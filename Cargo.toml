@@ -1,6 +1,6 @@
 [package]
 name = "appdock"
-version = "0.17.0"
+version = "0.18.0"
 edition = "2024"
 rust-version = "1.95"
 description = "Native macOS workspace for existing application windows"
